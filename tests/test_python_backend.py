@@ -316,3 +316,31 @@ class TestEdgeCases:
         main_content = (temp_python_project / "src" / "main.py").read_text()
         assert "src.storage.db" in main_content or "storage.db" in main_content
         assert "src.core.utils" in main_content or "core.utils" in main_content
+
+    def test_path_traversal_source_blocked(self, python_backend, temp_python_project):
+        """Path traversal in source should be blocked."""
+        with pytest.raises(ValueError) as exc_info:
+            python_backend.move_module(
+                source="../outside.py",
+                target="src/inside.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+            )
+        assert "escapes project root" in str(exc_info.value)
+
+    def test_path_traversal_target_blocked(self, python_backend, temp_python_project):
+        """Path traversal in target should be blocked."""
+        with pytest.raises(ValueError) as exc_info:
+            python_backend.move_module(
+                source="src/utils.py",
+                target="../outside.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+            )
+        assert "escapes project root" in str(exc_info.value)
+
+    def test_invalid_project_root_handled(self, python_backend, tmp_path):
+        """Invalid project root should return error."""
+        errors = python_backend.validate_imports(str(tmp_path / "nonexistent"))
+        assert len(errors) == 1
+        assert errors[0]["type"] == "invalid_root"

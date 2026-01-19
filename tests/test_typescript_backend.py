@@ -55,7 +55,7 @@ class TestMoveModule:
         )
 
         assert result["success"]
-        assert result["dryRun"] or result.get("dry_run")
+        assert result["dry_run"]
         # Original file should still exist
         assert (temp_typescript_project / "src" / "db.ts").exists()
 
@@ -68,9 +68,8 @@ class TestMoveModule:
             dry_run=True,
         )
 
-        assert "affectedFiles" in result or "affected_files" in result
-        affected = result.get("affectedFiles") or result.get("affected_files", [])
-        assert len(affected) > 0
+        assert "affected_files" in result
+        assert len(result["affected_files"]) > 0
 
 
 class TestMoveSymbol:
@@ -252,3 +251,36 @@ export function Component() {
         # TSX file should be updated
         tsx_content = (temp_typescript_project / "src" / "component.tsx").read_text()
         assert "assistFunc" in tsx_content
+
+    def test_path_traversal_blocked(self, typescript_backend, temp_typescript_project):
+        """Path traversal should be blocked."""
+        with pytest.raises(Exception) as exc_info:
+            typescript_backend.move_module(
+                source="../outside.ts",
+                target="src/inside.ts",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+        assert "escapes project root" in str(exc_info.value)
+
+    def test_move_symbol_updates_imports_in_consumers(self, typescript_backend, temp_typescript_project):
+        """Moving a symbol should update imports in files that use it."""
+        # Create target file
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        # Move helperFunc from utils to helpers
+        typescript_backend.move_symbol(
+            source_file="src/utils.ts",
+            symbol_name="helperFunc",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        # Check that main.ts now imports from helpers instead of utils
+        main_content = (temp_typescript_project / "src" / "main.ts").read_text()
+        # Should import helperFunc from helpers
+        assert "helpers" in main_content
+        # Should no longer have helperFunc import from utils
+        utils_imports = [line for line in main_content.split("\n") if "utils" in line and "helperFunc" in line]
+        assert len(utils_imports) == 0
