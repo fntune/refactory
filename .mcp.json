@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "refactory": {
+      "command": "python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/main.py"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}/server"
+    }
+  }
+}

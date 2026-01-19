@@ -1,0 +1,25 @@
+[project]
+name = "refactory"
+version = "1.0.0"
+description = "Token-efficient codebase refactoring plugin for Claude Code"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "rope>=1.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["server"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"

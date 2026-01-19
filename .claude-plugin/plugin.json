@@ -1,0 +1,9 @@
+{
+  "name": "refactory",
+  "version": "1.0.0",
+  "description": "Token-efficient codebase refactoring via MCP tools - move modules, rename symbols, update imports automatically",
+  "author": {
+    "name": "sour4bh"
+  },
+  "keywords": ["refactoring", "imports", "reorganization", "rope", "typescript"]
+}

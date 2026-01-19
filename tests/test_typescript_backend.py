@@ -1,0 +1,254 @@
+"""Hermetic tests for TypeScript refactoring backend (ts-morph)."""
+from pathlib import Path
+
+import pytest
+
+# Check if ts-morph is available
+TSMORPH_SCRIPT = Path(__file__).parent.parent / "server" / "tsmorph" / "refactor.js"
+TSMORPH_AVAILABLE = (
+    TSMORPH_SCRIPT.exists()
+    and (TSMORPH_SCRIPT.parent / "node_modules").exists()
+)
+
+pytestmark = pytest.mark.skipif(
+    not TSMORPH_AVAILABLE,
+    reason="ts-morph not installed. Run: cd server/tsmorph && pnpm install"
+)
+
+
+class TestMoveModule:
+    """Tests for move_module operation."""
+
+    def test_move_module_creates_target_directory(self, typescript_backend, temp_typescript_project):
+        """Moving a module should create target directory structure."""
+        result = typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        assert (temp_typescript_project / "src" / "storage" / "db.ts").exists()
+        assert not (temp_typescript_project / "src" / "db.ts").exists()
+
+    def test_move_module_updates_imports(self, typescript_backend, temp_typescript_project):
+        """Moving a module should update imports in dependent files."""
+        typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        main_content = (temp_typescript_project / "src" / "main.ts").read_text()
+        # Import path should be updated
+        assert "./storage/db" in main_content or "storage/db" in main_content
+
+    def test_move_module_dry_run_no_changes(self, typescript_backend, temp_typescript_project):
+        """Dry run should preview without making changes."""
+        result = typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=True,
+        )
+
+        assert result["success"]
+        assert result["dryRun"] or result.get("dry_run")
+        # Original file should still exist
+        assert (temp_typescript_project / "src" / "db.ts").exists()
+
+    def test_move_module_reports_affected_files(self, typescript_backend, temp_typescript_project):
+        """Should report all files that will be modified."""
+        result = typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=True,
+        )
+
+        assert "affectedFiles" in result or "affected_files" in result
+        affected = result.get("affectedFiles") or result.get("affected_files", [])
+        assert len(affected) > 0
+
+
+class TestMoveSymbol:
+    """Tests for move_symbol operation."""
+
+    def test_move_function_to_new_module(self, typescript_backend, temp_typescript_project):
+        """Moving a function should update all references."""
+        # Create target file
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        result = typescript_backend.move_symbol(
+            source_file="src/utils.ts",
+            symbol_name="helperFunc",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+
+        # Function should be in new location
+        helpers_content = (temp_typescript_project / "src" / "helpers.ts").read_text()
+        assert "helperFunc" in helpers_content
+
+    def test_move_class(self, typescript_backend, temp_typescript_project):
+        """Moving a class should work correctly."""
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        result = typescript_backend.move_symbol(
+            source_file="src/utils.ts",
+            symbol_name="HelperClass",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+
+        helpers_content = (temp_typescript_project / "src" / "helpers.ts").read_text()
+        assert "HelperClass" in helpers_content
+
+    def test_move_symbol_dry_run(self, typescript_backend, temp_typescript_project):
+        """Dry run should not modify files."""
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+        original_utils = (temp_typescript_project / "src" / "utils.ts").read_text()
+
+        result = typescript_backend.move_symbol(
+            source_file="src/utils.ts",
+            symbol_name="helperFunc",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=True,
+        )
+
+        assert result["success"]
+        # Original should be unchanged
+        assert (temp_typescript_project / "src" / "utils.ts").read_text() == original_utils
+
+
+class TestRenameSymbol:
+    """Tests for rename_symbol operation."""
+
+    def test_rename_function(self, typescript_backend, temp_typescript_project):
+        """Renaming a function should update all references."""
+        result = typescript_backend.rename_symbol(
+            file="src/utils.ts",
+            old_name="helperFunc",
+            new_name="assistFunc",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+
+        # Function should be renamed
+        utils_content = (temp_typescript_project / "src" / "utils.ts").read_text()
+        assert "assistFunc" in utils_content
+        assert "function helperFunc" not in utils_content
+
+    def test_rename_class(self, typescript_backend, temp_typescript_project):
+        """Renaming a class should update all references."""
+        result = typescript_backend.rename_symbol(
+            file="src/utils.ts",
+            old_name="HelperClass",
+            new_name="AssistantClass",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+
+        utils_content = (temp_typescript_project / "src" / "utils.ts").read_text()
+        assert "AssistantClass" in utils_content
+
+        # Check imports updated
+        main_content = (temp_typescript_project / "src" / "main.ts").read_text()
+        assert "AssistantClass" in main_content
+
+    def test_rename_dry_run_no_changes(self, typescript_backend, temp_typescript_project):
+        """Dry run should not modify files."""
+        original = (temp_typescript_project / "src" / "utils.ts").read_text()
+
+        typescript_backend.rename_symbol(
+            file="src/utils.ts",
+            old_name="helperFunc",
+            new_name="assistFunc",
+            project_root=str(temp_typescript_project),
+            dry_run=True,
+        )
+
+        assert (temp_typescript_project / "src" / "utils.ts").read_text() == original
+
+
+class TestValidateImports:
+    """Tests for validate_imports operation."""
+
+    def test_valid_project_no_errors(self, typescript_backend, temp_typescript_project):
+        """Valid project should have no import errors."""
+        errors = typescript_backend.validate_imports(str(temp_typescript_project))
+        assert len(errors) == 0
+
+    def test_detects_broken_import(self, typescript_backend, temp_typescript_project):
+        """Should detect broken imports."""
+        (temp_typescript_project / "src" / "broken.ts").write_text(
+            'import { something } from "./nonexistent";\n'
+        )
+
+        errors = typescript_backend.validate_imports(str(temp_typescript_project))
+        assert len(errors) > 0
+
+
+class TestEdgeCases:
+    """Tests for edge cases."""
+
+    def test_move_nonexistent_symbol_raises(self, typescript_backend, temp_typescript_project):
+        """Moving nonexistent symbol should raise error."""
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        with pytest.raises(Exception):
+            typescript_backend.move_symbol(
+                source_file="src/utils.ts",
+                symbol_name="nonExistentFunc",
+                target_file="src/helpers.ts",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+
+    def test_rename_nonexistent_symbol_raises(self, typescript_backend, temp_typescript_project):
+        """Renaming nonexistent symbol should raise error."""
+        with pytest.raises(Exception):
+            typescript_backend.rename_symbol(
+                file="src/utils.ts",
+                old_name="nonExistentFunc",
+                new_name="newName",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+
+    def test_handles_tsx_files(self, typescript_backend, temp_typescript_project):
+        """Should handle TSX files correctly."""
+        (temp_typescript_project / "src" / "component.tsx").write_text('''
+import { helperFunc } from "./utils";
+
+export function Component() {
+    return <div>{helperFunc()}</div>;
+}
+''')
+
+        result = typescript_backend.rename_symbol(
+            file="src/utils.ts",
+            old_name="helperFunc",
+            new_name="assistFunc",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+
+        # TSX file should be updated
+        tsx_content = (temp_typescript_project / "src" / "component.tsx").read_text()
+        assert "assistFunc" in tsx_content

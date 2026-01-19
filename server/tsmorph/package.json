@@ -1,0 +1,9 @@
+{
+  "name": "refactory-tsmorph",
+  "version": "1.0.0",
+  "private": true,
+  "main": "refactor.js",
+  "dependencies": {
+    "ts-morph": "^23.0.0"
+  }
+}
