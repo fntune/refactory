@@ -1,7 +1,11 @@
 """Python refactoring backend using Rope."""
 import ast
+import importlib
 import importlib.util
 import logging
+import shutil
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +34,28 @@ class PythonBackend:
     def _find_resource(self, project, file_path: str):
         """Find a resource in the project."""
         return project.get_resource(file_path)
+
+    def _run_in_temp_project(
+        self,
+        project_root: str,
+        operation: Callable[[str], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Run a dry-run operation against an isolated project copy."""
+        root = Path(project_root).resolve()
+        if not root.exists():
+            raise ValueError(f"Project root does not exist: {project_root}")
+
+        with tempfile.TemporaryDirectory(prefix="refactory-python-dry-run-") as temp_dir:
+            temp_root = Path(temp_dir) / root.name
+            shutil.copytree(
+                root,
+                temp_root,
+                ignore=shutil.ignore_patterns("__pycache__", ".venv", ".ropeproject"),
+            )
+            result = operation(str(temp_root))
+
+        result["dry_run"] = True
+        return result
 
     def _find_symbol_offset(self, source: str, name: str) -> int:
         """Find byte offset of a symbol definition using AST."""
@@ -67,12 +93,329 @@ class PythonBackend:
             name_start = col_offset
         return offset + name_start
 
+    def _module_parts_for_file(self, py_file: Path, root: Path) -> list[str]:
+        """Get the dotted module path for a file relative to the project root."""
+        module_parts = list(py_file.relative_to(root).with_suffix("").parts)
+        if module_parts and module_parts[-1] == "__init__":
+            module_parts.pop()
+        return module_parts
+
+    def _resolve_import_parts(
+        self,
+        py_file: Path,
+        root: Path,
+        module: str | None,
+        level: int,
+    ) -> list[str] | None:
+        """Resolve an import target to module parts within the project."""
+        package_parts = self._module_parts_for_file(py_file, root)
+        if py_file.name != "__init__.py" and package_parts:
+            package_parts = package_parts[:-1]
+
+        if level:
+            parent_hops = level - 1
+            if parent_hops > len(package_parts):
+                return None
+            base_parts = package_parts[: len(package_parts) - parent_hops]
+        else:
+            base_parts = []
+
+        module_parts = module.split(".") if module else []
+        return base_parts + module_parts
+
+    def _find_local_module(self, root: Path, module_parts: list[str]) -> Path | None:
+        """Find a local module file or package init for module parts."""
+        if not module_parts:
+            init_file = root / "__init__.py"
+            return init_file if init_file.exists() else None
+
+        module_base = root.joinpath(*module_parts)
+        module_file = module_base.with_suffix(".py")
+        if module_file.exists():
+            return module_file
+
+        package_init = module_base / "__init__.py"
+        if package_init.exists():
+            return package_init
+
+        if module_base.is_dir():
+            return module_base
+
+        return None
+
+    def _module_exists_externally(self, module_name: str) -> bool:
+        """Check whether a module resolves outside the project."""
+        try:
+            return importlib.util.find_spec(module_name) is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return False
+
+    def _collect_external_bound_names(
+        self,
+        module_name: str,
+        external_exports_cache: dict[str, set[str] | None],
+    ) -> set[str] | None:
+        """Collect statically visible names for source-based external modules."""
+        cached = external_exports_cache.get(module_name)
+        if module_name in external_exports_cache:
+            return cached
+
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            external_exports_cache[module_name] = None
+            return None
+
+        origin = getattr(spec, "origin", None)
+        if spec is None:
+            external_exports_cache[module_name] = None
+            return None
+
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            module = None
+
+        if module is not None:
+            names = set(dir(module))
+            external_exports_cache[module_name] = names
+            return names
+
+        if origin in {None, "built-in", "frozen"}:
+            external_exports_cache[module_name] = None
+            return None
+
+        origin_path = Path(origin)
+        if origin_path.suffix not in {".py", ".pyi"} or not origin_path.exists():
+            external_exports_cache[module_name] = None
+            return None
+
+        names: set[str] = set()
+        try:
+            tree = ast.parse(origin_path.read_text())
+        except SyntaxError:
+            external_exports_cache[module_name] = None
+            return None
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+                continue
+
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+                continue
+
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+                continue
+
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+                continue
+
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name != "*":
+                        names.add(alias.asname or alias.name)
+
+        external_exports_cache[module_name] = names
+        return names
+
+    def _collect_bound_names(
+        self,
+        module_path: Path,
+        root: Path,
+        exports_cache: dict[Path, set[str]],
+    ) -> set[str]:
+        """Collect names bound at module top level without executing code."""
+        cached = exports_cache.get(module_path)
+        if cached is not None:
+            return cached
+
+        names: set[str] = set()
+        if module_path.is_dir():
+            exports_cache[module_path] = names
+            return names
+
+        try:
+            tree = ast.parse(module_path.read_text())
+        except SyntaxError:
+            exports_cache[module_path] = names
+            return names
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+                continue
+
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+                continue
+
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+                continue
+
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_parts = alias.name.split(".")
+                    if self._find_local_module(root, module_parts) is not None:
+                        names.add(alias.asname or alias.name.split(".")[0])
+                        continue
+                    if self._module_exists_externally(alias.name):
+                        names.add(alias.asname or alias.name.split(".")[0])
+                continue
+
+            if isinstance(node, ast.ImportFrom):
+                module_parts = self._resolve_import_parts(module_path, root, node.module, node.level)
+                if module_parts is None:
+                    continue
+
+                local_module = self._find_local_module(root, module_parts)
+                if local_module is None:
+                    external_name = ".".join(module_parts)
+                    if node.level or not external_name or not self._module_exists_externally(external_name):
+                        continue
+
+                for alias in node.names:
+                    if alias.name != "*":
+                        names.add(alias.asname or alias.name)
+
+        exports_cache[module_path] = names
+        return names
+
+    def _format_import_target(self, module: str | None, level: int) -> str:
+        """Render an import target for error messages."""
+        prefix = "." * level
+        if module:
+            return f"{prefix}{module}"
+        return prefix or "<module>"
+
+    def _validate_import_node(
+        self,
+        node: ast.Import,
+        py_file: Path,
+        root: Path,
+    ) -> list[dict[str, Any]]:
+        """Validate plain import statements."""
+        errors = []
+        for alias in node.names:
+            module_parts = alias.name.split(".")
+            if self._find_local_module(root, module_parts) is not None:
+                continue
+            if self._module_exists_externally(alias.name):
+                continue
+
+            errors.append({
+                "file": str(py_file.relative_to(root)),
+                "line": node.lineno,
+                "import": alias.name,
+                "type": "unresolved_import",
+            })
+
+        return errors
+
+    def _validate_import_from_node(
+        self,
+        node: ast.ImportFrom,
+        py_file: Path,
+        root: Path,
+        exports_cache: dict[Path, set[str]],
+        external_exports_cache: dict[str, set[str] | None],
+    ) -> list[dict[str, Any]]:
+        """Validate from-import statements without importing user code."""
+        errors = []
+        import_target = self._format_import_target(node.module, node.level)
+        module_parts = self._resolve_import_parts(py_file, root, node.module, node.level)
+
+        if module_parts is None:
+            return [{
+                "file": str(py_file.relative_to(root)),
+                "line": node.lineno,
+                "import": import_target,
+                "type": "unresolved_import",
+            }]
+
+        local_module = self._find_local_module(root, module_parts)
+        if local_module is None:
+            if node.level:
+                return [{
+                    "file": str(py_file.relative_to(root)),
+                    "line": node.lineno,
+                    "import": import_target,
+                    "type": "unresolved_import",
+                }]
+
+            external_name = ".".join(module_parts)
+            if not external_name or not self._module_exists_externally(external_name):
+                return [{
+                    "file": str(py_file.relative_to(root)),
+                    "line": node.lineno,
+                    "import": import_target,
+                    "type": "unresolved_import",
+                }]
+
+        if any(alias.name == "*" for alias in node.names):
+            return errors
+
+        if local_module is not None:
+            available_names = self._collect_bound_names(local_module, root, exports_cache)
+            for alias in node.names:
+                imported_name = alias.name
+                if imported_name in available_names:
+                    continue
+                if self._find_local_module(root, module_parts + [imported_name]) is not None:
+                    continue
+
+                errors.append({
+                    "file": str(py_file.relative_to(root)),
+                    "line": node.lineno,
+                    "import": import_target,
+                    "name": imported_name,
+                    "type": "unresolved_import_name",
+                })
+
+            return errors
+
+        external_name = ".".join(module_parts)
+        external_names = self._collect_external_bound_names(
+            external_name,
+            external_exports_cache,
+        )
+        if external_names is None:
+            return errors
+
+        for alias in node.names:
+            imported_name = alias.name
+            if imported_name not in external_names:
+                errors.append({
+                    "file": str(py_file.relative_to(root)),
+                    "line": node.lineno,
+                    "import": import_target,
+                    "name": imported_name,
+                    "type": "unresolved_import_name",
+                })
+
+        return errors
+
     def move_module(
         self, source: str, target: str, project_root: str, dry_run: bool
     ) -> dict[str, Any]:
         """Move a Python module and update all imports."""
         from rope.refactor.move import MoveModule
         from rope.refactor.rename import Rename
+
+        if dry_run:
+            return self._run_in_temp_project(
+                project_root,
+                lambda temp_root: self.move_module(source, target, temp_root, False),
+            )
 
         # Validate paths
         self._validate_path(source, project_root)
@@ -88,13 +431,7 @@ class PythonBackend:
 
             # Ensure target directory exists as a package
             target_dir_path = Path(project_root) / target_dir
-            if not dry_run:
-                target_dir_path.mkdir(parents=True, exist_ok=True)
-                init_file = target_dir_path / "__init__.py"
-                if not init_file.exists():
-                    init_file.touch()
-            elif not target_dir_path.exists():
-                # For dry_run, create dir temporarily to compute changes
+            if not target_dir_path.exists():
                 target_dir_path.mkdir(parents=True, exist_ok=True)
                 init_file = target_dir_path / "__init__.py"
                 if not init_file.exists():
@@ -106,29 +443,28 @@ class PythonBackend:
 
             affected_files = [f.path for f in changes.get_changed_resources()]
 
-            if not dry_run:
-                project.do(changes)
+            project.do(changes)
 
-                # Handle rename if target filename differs
-                if source_stem != target_stem:
-                    # Use Rope's rename to properly update imports
-                    moved_file_path = f"{target_dir}/{source_stem}.py"
-                    try:
-                        moved_resource = self._find_resource(project, moved_file_path)
-                        renamer = Rename(project, moved_resource, None)
-                        rename_changes = renamer.get_changes(target_stem)
-                        project.do(rename_changes)
-                        affected_files.extend(
-                            f.path for f in rename_changes.get_changed_resources()
-                            if f.path not in affected_files
-                        )
-                    except Exception as e:
-                        # Fallback to manual rename if Rope rename fails
-                        logger.warning(f"Rope rename failed, using manual rename: {e}")
-                        moved_file = Path(project_root) / target_dir / f"{source_stem}.py"
-                        final_file = Path(project_root) / target
-                        if moved_file.exists():
-                            moved_file.rename(final_file)
+            # Handle rename if target filename differs
+            if source_stem != target_stem:
+                # Use Rope's rename to properly update imports
+                moved_file_path = f"{target_dir}/{source_stem}.py"
+                try:
+                    moved_resource = self._find_resource(project, moved_file_path)
+                    renamer = Rename(project, moved_resource, None)
+                    rename_changes = renamer.get_changes(target_stem)
+                    project.do(rename_changes)
+                    affected_files.extend(
+                        f.path for f in rename_changes.get_changed_resources()
+                        if f.path not in affected_files
+                    )
+                except Exception as e:
+                    # Fallback to manual rename if Rope rename fails
+                    logger.warning(f"Rope rename failed, using manual rename: {e}")
+                    moved_file = Path(project_root) / target_dir / f"{source_stem}.py"
+                    final_file = Path(project_root) / target
+                    if moved_file.exists():
+                        moved_file.rename(final_file)
 
             return {
                 "success": True,
@@ -151,6 +487,18 @@ class PythonBackend:
     ) -> dict[str, Any]:
         """Move a symbol (function/class) to another module."""
         from rope.refactor.move import MoveGlobal
+
+        if dry_run:
+            return self._run_in_temp_project(
+                project_root,
+                lambda temp_root: self.move_symbol(
+                    source_file,
+                    symbol_name,
+                    target_file,
+                    temp_root,
+                    False,
+                ),
+            )
 
         # Validate paths
         self._validate_path(source_file, project_root)
@@ -177,8 +525,7 @@ class PythonBackend:
 
             affected_files = [f.path for f in changes.get_changed_resources()]
 
-            if not dry_run:
-                project.do(changes)
+            project.do(changes)
 
             return {
                 "success": True,
@@ -197,6 +544,18 @@ class PythonBackend:
         """Rename a symbol across the codebase."""
         from rope.refactor.rename import Rename
 
+        if dry_run:
+            return self._run_in_temp_project(
+                project_root,
+                lambda temp_root: self.rename_symbol(
+                    file,
+                    old_name,
+                    new_name,
+                    temp_root,
+                    False,
+                ),
+            )
+
         # Validate path
         self._validate_path(file, project_root)
 
@@ -211,8 +570,7 @@ class PythonBackend:
 
             affected_files = [f.path for f in changes.get_changed_resources()]
 
-            if not dry_run:
-                project.do(changes)
+            project.do(changes)
 
             return {
                 "success": True,
@@ -229,6 +587,8 @@ class PythonBackend:
         """Check for broken imports in Python files."""
         errors = []
         root = Path(project_root).resolve()
+        exports_cache: dict[Path, set[str]] = {}
+        external_exports_cache: dict[str, set[str] | None] = {}
 
         if not root.exists():
             return [{"error": f"Project root does not exist: {project_root}", "type": "invalid_root"}]
@@ -241,24 +601,18 @@ class PythonBackend:
                 tree = ast.parse(source)
 
                 for node in ast.walk(tree):
-                    if isinstance(node, (ast.Import, ast.ImportFrom)):
-                        if isinstance(node, ast.ImportFrom) and node.module:
-                            module_path = node.module.replace(".", "/")
-                            possible_paths = [
-                                root / f"{module_path}.py",
-                                root / module_path / "__init__.py",
-                            ]
-                            if not any(p.exists() for p in possible_paths):
-                                # Check if it's a stdlib or third-party module
-                                # Use find_spec instead of __import__ to avoid code execution
-                                top_module = node.module.split(".")[0]
-                                if importlib.util.find_spec(top_module) is None:
-                                    errors.append({
-                                        "file": str(py_file.relative_to(root)),
-                                        "line": node.lineno,
-                                        "import": node.module,
-                                        "type": "unresolved_import",
-                                    })
+                    if isinstance(node, ast.Import):
+                        errors.extend(self._validate_import_node(node, py_file, root))
+                    elif isinstance(node, ast.ImportFrom):
+                        errors.extend(
+                            self._validate_import_from_node(
+                                node,
+                                py_file,
+                                root,
+                                exports_cache,
+                                external_exports_cache,
+                            )
+                        )
             except SyntaxError as e:
                 errors.append({
                     "file": str(py_file.relative_to(root)),

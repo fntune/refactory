@@ -4,6 +4,7 @@
  * Called by the Python backend via subprocess.
  */
 const { Project } = require("ts-morph");
+const { SyntaxKind } = require("ts-morph");
 const path = require("path");
 const fs = require("fs");
 
@@ -41,15 +42,179 @@ function getProject(projectRoot) {
   });
 }
 
-/**
- * Get the module specifier that an import uses to reference a source file.
- */
-function getModuleSpecifierForFile(importDecl, targetSourceFile) {
-  const resolvedModule = importDecl.getModuleSpecifierSourceFile();
-  if (resolvedModule && resolvedModule.getFilePath() === targetSourceFile.getFilePath()) {
-    return importDecl;
+function loadProjectSourceFiles(project, root) {
+  project.addSourceFilesAtPaths([
+    path.join(root, "**/*.ts"),
+    path.join(root, "**/*.tsx"),
+    path.join(root, "**/*.js"),
+    path.join(root, "**/*.jsx"),
+    "!" + path.join(root, "**/node_modules/**"),
+  ]);
+
+  return project
+    .getSourceFiles()
+    .filter((sourceFile) => {
+      const filePath = sourceFile.getFilePath();
+      return (
+        filePath === root
+        || filePath.startsWith(root + path.sep)
+      ) && !filePath.includes(`${path.sep}node_modules${path.sep}`);
+    });
+}
+
+function toModuleSpecifier(fromFilePath, targetFilePath) {
+  let newSpecifier = path.relative(path.dirname(fromFilePath), targetFilePath);
+  if (!newSpecifier.startsWith(".")) {
+    newSpecifier = "./" + newSpecifier;
   }
-  return null;
+  return newSpecifier.replace(/\\/g, "/").replace(/\.(ts|tsx|js|jsx)$/, "");
+}
+
+function resolveLocalModuleSpecifier(refFilePath, specifier) {
+  if (!specifier.startsWith(".")) {
+    return null;
+  }
+
+  const basePath = path.resolve(path.dirname(refFilePath), specifier);
+  const candidates = [
+    basePath,
+    `${basePath}.ts`,
+    `${basePath}.tsx`,
+    `${basePath}.js`,
+    `${basePath}.jsx`,
+    path.join(basePath, "index.ts"),
+    path.join(basePath, "index.tsx"),
+    path.join(basePath, "index.js"),
+    path.join(basePath, "index.jsx"),
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
+
+function getRequireCallsReferencingFile(refFile, sourceFilePath) {
+  return refFile.getDescendantsOfKind(SyntaxKind.CallExpression).filter((callExpr) => {
+    if (callExpr.getExpression().getText() !== "require") {
+      return false;
+    }
+
+    const [firstArg] = callExpr.getArguments();
+    if (!firstArg) {
+      return false;
+    }
+
+    const argKind = firstArg.getKind();
+    if (argKind !== SyntaxKind.StringLiteral && argKind !== SyntaxKind.NoSubstitutionTemplateLiteral) {
+      return false;
+    }
+
+    const resolvedPath = resolveLocalModuleSpecifier(refFile.getFilePath(), firstArg.getLiteralValue());
+    return resolvedPath === sourceFilePath;
+  });
+}
+
+function collectModuleReferences(files, sourceFilePath, predicate) {
+  return files
+    .filter((file) => file.getFilePath() !== sourceFilePath)
+    .map((file) => predicate(file))
+    .filter((entry) => (
+      entry.imports.length > 0
+      || entry.exports.length > 0
+      || entry.requires.length > 0
+    ));
+}
+
+function buildNamedSpecifier(name, alias, isTypeOnly) {
+  if (!alias && !isTypeOnly) {
+    return name;
+  }
+
+  return { name, alias, isTypeOnly };
+}
+
+function ensureNamedImport(refFile, moduleSpecifier, options) {
+  const existingImport = refFile.getImportDeclarations().find((decl) => {
+    return decl.getModuleSpecifierValue() === moduleSpecifier
+      && !decl.getNamespaceImport()
+      && !(decl.isTypeOnly() && !options.isTypeOnly);
+  });
+
+  if (existingImport) {
+    const alreadyPresent = existingImport.getNamedImports().some((namedImport) => {
+      const alias = namedImport.getAliasNode()?.getText();
+      return namedImport.getName() === options.name
+        && alias === options.alias
+        && namedImport.isTypeOnly() === options.isTypeOnly;
+    });
+
+    if (!alreadyPresent) {
+      existingImport.addNamedImport(
+        buildNamedSpecifier(options.name, options.alias, options.isTypeOnly)
+      );
+    }
+    return;
+  }
+
+  refFile.addImportDeclaration({
+    moduleSpecifier,
+    namedImports: [buildNamedSpecifier(options.name, options.alias, options.isTypeOnly)],
+  });
+}
+
+function ensureNamedExport(refFile, moduleSpecifier, options) {
+  const existingExport = refFile.getExportDeclarations().find((decl) => {
+    return decl.getModuleSpecifierValue() === moduleSpecifier
+      && !(decl.isTypeOnly() && !options.isTypeOnly);
+  });
+
+  if (existingExport) {
+    const alreadyPresent = existingExport.getNamedExports().some((namedExport) => {
+      const alias = namedExport.getAliasNode()?.getText();
+      return namedExport.getName() === options.name
+        && alias === options.alias
+        && namedExport.isTypeOnly() === options.isTypeOnly;
+    });
+
+    if (!alreadyPresent) {
+      existingExport.addNamedExport(
+        buildNamedSpecifier(options.name, options.alias, options.isTypeOnly)
+      );
+    }
+    return;
+  }
+
+  refFile.addExportDeclaration({
+    moduleSpecifier,
+    namedExports: [buildNamedSpecifier(options.name, options.alias, options.isTypeOnly)],
+  });
+}
+
+function removeEmptyImportDeclaration(importDecl) {
+  if (
+    importDecl.getNamedImports().length === 0
+    && !importDecl.getDefaultImport()
+    && !importDecl.getNamespaceImport()
+  ) {
+    importDecl.remove();
+  }
+}
+
+function removeEmptyExportDeclaration(exportDecl) {
+  if (exportDecl.getNamedExports().length === 0) {
+    exportDecl.remove();
+  }
+}
+
+function getMovedSymbolText(symbol) {
+  if (symbol.getKind() === SyntaxKind.VariableDeclaration) {
+    const variableStatement = symbol.getVariableStatement();
+    const declarationKind = variableStatement
+      ? variableStatement.getDeclarationKind()
+      : "const";
+    const exportPrefix = variableStatement && variableStatement.isExported() ? "export " : "";
+    return `${exportPrefix}${declarationKind} ${symbol.getText()};`;
+  }
+
+  return symbol.getFullText();
 }
 
 function moveModule(args) {
@@ -61,13 +226,26 @@ function moveModule(args) {
 
   const project = getProject(projectRoot);
   const root = path.resolve(projectRoot);
+  const allFiles = loadProjectSourceFiles(project, root);
 
   const sourceFile = project.addSourceFileAtPath(path.join(root, source));
+  const sourceFilePath = sourceFile.getFilePath();
   const targetDir = path.dirname(path.join(root, target));
+  const targetFilePath = path.join(root, target);
 
-  // Get all files that import this module BEFORE moving
-  const referencingFiles = sourceFile.getReferencingSourceFiles();
-  const affectedFiles = [source, ...referencingFiles.map((f) => path.relative(root, f.getFilePath()))];
+  const moduleReferences = collectModuleReferences(allFiles, sourceFilePath, (refFile) => ({
+    file: refFile,
+    imports: refFile.getImportDeclarations().filter((imp) => {
+      const resolvedFile = imp.getModuleSpecifierSourceFile();
+      return resolvedFile && resolvedFile.getFilePath() === sourceFilePath;
+    }),
+    exports: refFile.getExportDeclarations().filter((exp) => {
+      const resolvedFile = exp.getModuleSpecifierSourceFile();
+      return resolvedFile && resolvedFile.getFilePath() === sourceFilePath;
+    }),
+    requires: getRequireCallsReferencingFile(refFile, sourceFilePath),
+  }));
+  const affectedFiles = [source, ...moduleReferences.map((entry) => path.relative(root, entry.file.getFilePath()))];
 
   if (!dryRun) {
     // Ensure target directory exists
@@ -76,24 +254,23 @@ function moveModule(args) {
     }
 
     // Move the file
-    sourceFile.move(path.join(root, target));
+    sourceFile.move(targetFilePath);
 
-    // Update imports in all referencing files using exact match
-    for (const refFile of referencingFiles) {
-      const imports = refFile.getImportDeclarations();
-      for (const imp of imports) {
-        // Check if this import resolves to our moved file
-        const resolvedFile = imp.getModuleSpecifierSourceFile();
-        if (resolvedFile && resolvedFile.getFilePath() === sourceFile.getFilePath()) {
-          // Compute new relative path
-          const newPath = path.relative(
-            path.dirname(refFile.getFilePath()),
-            path.join(root, target)
-          );
-          let newSpecifier = newPath.startsWith(".") ? newPath : "./" + newPath;
-          // Remove extension
-          newSpecifier = newSpecifier.replace(/\.(ts|tsx|js|jsx)$/, "");
-          imp.setModuleSpecifier(newSpecifier);
+    for (const entry of moduleReferences) {
+      const newSpecifier = toModuleSpecifier(entry.file.getFilePath(), targetFilePath);
+
+      for (const imp of entry.imports) {
+        imp.setModuleSpecifier(newSpecifier);
+      }
+
+      for (const exp of entry.exports) {
+        exp.setModuleSpecifier(newSpecifier);
+      }
+
+      for (const requireCall of entry.requires) {
+        const [firstArg] = requireCall.getArguments();
+        if (firstArg) {
+          firstArg.replaceWithText(JSON.stringify(newSpecifier));
         }
       }
     }
@@ -122,6 +299,7 @@ function moveSymbol(args) {
   const root = path.resolve(projectRoot);
 
   const sourceFile = project.addSourceFileAtPath(path.join(root, srcPath));
+  const sourceFilePath = sourceFile.getFilePath();
   let targetFile = project.getSourceFile(path.join(root, tgtPath));
 
   if (!targetFile) {
@@ -143,6 +321,8 @@ function moveSymbol(args) {
     throw new Error(`Symbol '${symbolName}' not found in ${srcPath}`);
   }
 
+  const targetFilePath = targetFile.getFilePath();
+
   // Find all files that reference this symbol
   const referencingNodes = symbol.findReferencesAsNodes ? symbol.findReferencesAsNodes() : [];
   const referencingFiles = [...new Set(referencingNodes.map((n) => n.getSourceFile()))];
@@ -151,58 +331,65 @@ function moveSymbol(args) {
     .map((f) => path.relative(root, f.getFilePath()))];
 
   if (!dryRun) {
-    // Check if symbol is exported
     const isExported = symbol.isExported ? symbol.isExported() : false;
-
+    const isTypeOnlySymbol = symbol.getKind() === SyntaxKind.InterfaceDeclaration
+      || symbol.getKind() === SyntaxKind.TypeAliasDeclaration;
     // Get the full text of the symbol including leading trivia (comments, etc)
-    const symbolText = symbol.getFullText();
+    const symbolText = getMovedSymbolText(symbol);
+    const sourceSpecifier = toModuleSpecifier(sourceFilePath, targetFilePath);
 
-    // Add to target file with export if it was exported
-    if (isExported) {
-      targetFile.addStatements(`export ${symbolText.trim()}`);
-    } else {
-      targetFile.addStatements(symbolText);
-    }
+    targetFile.addStatements(symbolText);
 
-    // Update imports in files that reference this symbol
+    const newSpecifierByFile = new Map();
     for (const refFile of referencingFiles) {
-      if (refFile.getFilePath() === sourceFile.getFilePath()) continue;
-      if (refFile.getFilePath() === targetFile.getFilePath()) continue;
+      if (refFile.getFilePath() === sourceFilePath) continue;
 
-      // Find imports from source file
+      const shouldAddReplacement = refFile.getFilePath() !== targetFilePath;
+      const newSpecifier = newSpecifierByFile.get(refFile.getFilePath())
+        || toModuleSpecifier(refFile.getFilePath(), targetFilePath);
+      newSpecifierByFile.set(refFile.getFilePath(), newSpecifier);
+
       const imports = refFile.getImportDeclarations();
       for (const imp of imports) {
         const resolvedFile = imp.getModuleSpecifierSourceFile();
-        if (resolvedFile && resolvedFile.getFilePath() === sourceFile.getFilePath()) {
-          // Check if this import includes our symbol
+        if (resolvedFile && resolvedFile.getFilePath() === sourceFilePath) {
           const namedImports = imp.getNamedImports();
-          const symbolImport = namedImports.find(n => n.getName() === symbolName);
+          const symbolImports = namedImports.filter((namedImport) => namedImport.getName() === symbolName);
 
-          if (symbolImport) {
-            // Remove this symbol from the import
+          for (const symbolImport of symbolImports) {
+            const alias = symbolImport.getAliasNode()?.getText();
+            const isTypeOnly = symbolImport.isTypeOnly();
             symbolImport.remove();
+            removeEmptyImportDeclaration(imp);
 
-            // If no named imports left, remove the whole import
-            if (imp.getNamedImports().length === 0) {
-              imp.remove();
+            if (shouldAddReplacement) {
+              ensureNamedImport(refFile, newSpecifier, {
+                name: symbolName,
+                alias,
+                isTypeOnly,
+              });
             }
+          }
+        }
+      }
 
-            // Add new import from target file
-            const newPath = path.relative(
-              path.dirname(refFile.getFilePath()),
-              targetFile.getFilePath()
-            );
-            let newSpecifier = newPath.startsWith(".") ? newPath : "./" + newPath;
-            newSpecifier = newSpecifier.replace(/\.(ts|tsx|js|jsx)$/, "");
+      const exports = refFile.getExportDeclarations();
+      for (const exp of exports) {
+        const resolvedFile = exp.getModuleSpecifierSourceFile();
+        if (resolvedFile && resolvedFile.getFilePath() === sourceFilePath) {
+          const symbolExports = exp.getNamedExports().filter((namedExport) => namedExport.getName() === symbolName);
 
-            // Check if import from target already exists
-            const existingImport = refFile.getImportDeclaration(newSpecifier);
-            if (existingImport) {
-              existingImport.addNamedImport(symbolName);
-            } else {
-              refFile.addImportDeclaration({
-                moduleSpecifier: newSpecifier,
-                namedImports: [symbolName],
+          for (const symbolExport of symbolExports) {
+            const alias = symbolExport.getAliasNode()?.getText();
+            const isTypeOnly = symbolExport.isTypeOnly();
+            symbolExport.remove();
+            removeEmptyExportDeclaration(exp);
+
+            if (shouldAddReplacement) {
+              ensureNamedExport(refFile, newSpecifier, {
+                name: symbolName,
+                alias,
+                isTypeOnly,
               });
             }
           }
@@ -212,6 +399,26 @@ function moveSymbol(args) {
 
     // Remove from source file
     symbol.remove();
+
+    const sourceStillReferencesSymbol = sourceFile
+      .getDescendantsOfKind(SyntaxKind.Identifier)
+      .some((identifier) => identifier.getText() === symbolName);
+
+    if (sourceStillReferencesSymbol) {
+      ensureNamedImport(sourceFile, sourceSpecifier, {
+        name: symbolName,
+        alias: undefined,
+        isTypeOnly: isTypeOnlySymbol,
+      });
+    }
+
+    if (isExported) {
+      ensureNamedExport(sourceFile, sourceSpecifier, {
+        name: symbolName,
+        alias: undefined,
+        isTypeOnly: isTypeOnlySymbol,
+      });
+    }
 
     project.saveSync();
   }
@@ -278,16 +485,9 @@ function validateImports(args) {
   }
 
   const project = getProject(projectRoot);
+  loadProjectSourceFiles(project, root);
 
   // Add all TS/JS files
-  project.addSourceFilesAtPaths([
-    path.join(root, "**/*.ts"),
-    path.join(root, "**/*.tsx"),
-    path.join(root, "**/*.js"),
-    path.join(root, "**/*.jsx"),
-    "!" + path.join(root, "**/node_modules/**"),
-  ]);
-
   const errors = [];
   const diagnostics = project.getPreEmitDiagnostics();
 

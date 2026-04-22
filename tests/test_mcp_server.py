@@ -109,6 +109,28 @@ class TestToolExecution:
         assert data["valid"]  # Project should have no errors
 
     @pytest.mark.asyncio
+    async def test_validate_imports_reports_errors(self, temp_python_project):
+        """validate_imports should surface Python import failures."""
+        from main import call_tool
+
+        (temp_python_project / "src" / "broken_import.py").write_text(
+            "import src.missing_module\n"
+        )
+
+        result = await call_tool("validate_imports", {
+            "project_root": str(temp_python_project),
+            "language": "python",
+        })
+
+        data = json.loads(result[0].text)
+        assert not data["valid"]
+        assert data["issues"][0]["language"] == "python"
+        assert any(
+            issue.get("file") == "src/broken_import.py"
+            for issue in data["issues"][0]["errors"]
+        )
+
+    @pytest.mark.asyncio
     async def test_unknown_tool_returns_error(self, temp_python_project):
         """Unknown tool should return error."""
         from main import call_tool
@@ -216,6 +238,8 @@ class TestDryRunMode:
 
         # File should not have moved
         assert (temp_python_project / "src" / "db.py").exists()
+        assert not (temp_python_project / "src" / "storage").exists()
+        assert not (temp_python_project / ".ropeproject").exists()
 
     @pytest.mark.asyncio
     async def test_dry_run_reports_changes(self, temp_python_project):

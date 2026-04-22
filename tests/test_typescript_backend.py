@@ -45,6 +45,40 @@ class TestMoveModule:
         # Import path should be updated
         assert "./storage/db" in main_content or "storage/db" in main_content
 
+    def test_move_module_updates_commonjs_require(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """Moving a module should update relative require consumers."""
+        (temp_typescript_project / "src" / "consumer.ts").write_text(
+            'const { Database } = require("./db");\n'
+        )
+
+        typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        consumer_content = (temp_typescript_project / "src" / "consumer.ts").read_text()
+        assert './storage/db' in consumer_content
+
+    def test_move_module_updates_re_exports(self, typescript_backend, temp_typescript_project):
+        """Moving a module should update re-export declarations."""
+        (temp_typescript_project / "src" / "index.ts").write_text(
+            'export * from "./db";\n'
+        )
+
+        typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        index_content = (temp_typescript_project / "src" / "index.ts").read_text()
+        assert './storage/db' in index_content
+
     def test_move_module_dry_run_no_changes(self, typescript_backend, temp_typescript_project):
         """Dry run should preview without making changes."""
         result = typescript_backend.move_module(
@@ -94,6 +128,37 @@ class TestMoveSymbol:
         helpers_content = (temp_typescript_project / "src" / "helpers.ts").read_text()
         assert "helperFunc" in helpers_content
 
+        utils_content = (temp_typescript_project / "src" / "utils.ts").read_text()
+        assert 'import { helperFunc } from "./helpers";' in utils_content
+        assert 'export { helperFunc } from "./helpers";' in utils_content
+
+    def test_move_variable_to_new_module(self, typescript_backend, temp_typescript_project):
+        """Moving a variable should preserve a valid declaration in the target file."""
+        (temp_typescript_project / "src" / "constants.ts").write_text(
+            "export const answer = 42;\n"
+        )
+        (temp_typescript_project / "src" / "consumer.ts").write_text(
+            'import { answer } from "./constants";\n'
+            "export const value = answer;\n"
+        )
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        result = typescript_backend.move_symbol(
+            source_file="src/constants.ts",
+            symbol_name="answer",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+
+        helpers_content = (temp_typescript_project / "src" / "helpers.ts").read_text()
+        consumer_content = (temp_typescript_project / "src" / "consumer.ts").read_text()
+
+        assert "export const answer = 42;" in helpers_content
+        assert 'import { answer } from "./helpers"' in consumer_content
+
     def test_move_class(self, typescript_backend, temp_typescript_project):
         """Moving a class should work correctly."""
         (temp_typescript_project / "src" / "helpers.ts").write_text("")
@@ -110,6 +175,108 @@ class TestMoveSymbol:
 
         helpers_content = (temp_typescript_project / "src" / "helpers.ts").read_text()
         assert "HelperClass" in helpers_content
+
+    def test_move_symbol_preserves_alias_imports(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """Moving a symbol should preserve aliased import consumers."""
+        (temp_typescript_project / "src" / "main.ts").write_text(
+            'import { helperFunc as help } from "./utils";\n'
+            "export const value = help();\n"
+        )
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        typescript_backend.move_symbol(
+            source_file="src/utils.ts",
+            symbol_name="helperFunc",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        main_content = (temp_typescript_project / "src" / "main.ts").read_text()
+        helpers_content = (temp_typescript_project / "src" / "helpers.ts").read_text()
+
+        assert 'import { helperFunc as help } from "./helpers"' in main_content
+        assert "help();" in main_content
+        assert "export export" not in helpers_content
+
+    def test_move_symbol_preserves_aliases_when_target_import_exists(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """Moving a symbol should preserve alias metadata when merging into an existing import."""
+        (temp_typescript_project / "src" / "helpers.ts").write_text(
+            'export function otherFunc(): string {\n'
+            '    return "x";\n'
+            "}\n"
+        )
+        (temp_typescript_project / "src" / "main.ts").write_text(
+            'import { otherFunc } from "./helpers";\n'
+            'import { helperFunc as help } from "./utils";\n'
+            "export const value = help() + otherFunc();\n"
+        )
+
+        typescript_backend.move_symbol(
+            source_file="src/utils.ts",
+            symbol_name="helperFunc",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        main_content = (temp_typescript_project / "src" / "main.ts").read_text()
+        assert 'import { otherFunc, helperFunc as help } from "./helpers"' in main_content
+        assert "help() + otherFunc()" in main_content
+
+    def test_move_symbol_updates_re_exports(self, typescript_backend, temp_typescript_project):
+        """Moving a symbol should update re-export declarations."""
+        (temp_typescript_project / "src" / "index.ts").write_text(
+            'export { helperFunc } from "./utils";\n'
+        )
+        (temp_typescript_project / "src" / "consumer.ts").write_text(
+            'const { helperFunc } = require("./utils");\n'
+            "export const value = helperFunc();\n"
+        )
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        typescript_backend.move_symbol(
+            source_file="src/utils.ts",
+            symbol_name="helperFunc",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        index_content = (temp_typescript_project / "src" / "index.ts").read_text()
+        utils_content = (temp_typescript_project / "src" / "utils.ts").read_text()
+        assert 'export { helperFunc } from "./helpers"' in index_content
+        assert 'export { helperFunc } from "./helpers";' in utils_content
+
+    def test_move_symbol_preserves_type_only_imports(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """Moving a type alias should preserve type-only imports."""
+        (temp_typescript_project / "src" / "types.ts").write_text(
+            "export type Helper = {\n"
+            "    value: string;\n"
+            "};\n"
+        )
+        (temp_typescript_project / "src" / "consumer.ts").write_text(
+            'import { type Helper } from "./types";\n'
+            'export const value: Helper = { value: "ok" };\n'
+        )
+        (temp_typescript_project / "src" / "helpers.ts").write_text("")
+
+        typescript_backend.move_symbol(
+            source_file="src/types.ts",
+            symbol_name="Helper",
+            target_file="src/helpers.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+        )
+
+        consumer_content = (temp_typescript_project / "src" / "consumer.ts").read_text()
+        assert 'import { type Helper } from "./helpers"' in consumer_content
 
     def test_move_symbol_dry_run(self, typescript_backend, temp_typescript_project):
         """Dry run should not modify files."""

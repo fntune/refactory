@@ -49,8 +49,10 @@ class TestMoveModule:
         # Original file should still exist with same content
         assert (temp_python_project / "src" / "db.py").exists()
         assert (temp_python_project / "src" / "db.py").read_text() == original_content
-        # Target file should not exist (directory may be created for Rope)
+        # Dry run should not leave behind target directories or Rope metadata
+        assert not (temp_python_project / "src" / "storage").exists()
         assert not (temp_python_project / "src" / "storage" / "db.py").exists()
+        assert not (temp_python_project / ".ropeproject").exists()
 
     def test_move_module_reports_affected_files(self, python_backend, temp_python_project):
         """Should report all files that will be modified."""
@@ -61,10 +63,8 @@ class TestMoveModule:
             dry_run=True,
         )
 
-        # Should include the moved file and main.py which imports it
-        assert "src/db.py" in result["affected_files"] or any(
-            "db.py" in f for f in result["affected_files"]
-        )
+        assert "src/db.py" in result["affected_files"]
+        assert "src/main.py" in result["affected_files"]
 
 
 class TestMoveSymbol:
@@ -128,6 +128,7 @@ class TestMoveSymbol:
         assert result["dry_run"]
         # Original should be unchanged
         assert (temp_python_project / "src" / "utils.py").read_text() == original_utils
+        assert not (temp_python_project / ".ropeproject").exists()
 
 
 class TestRenameSymbol:
@@ -202,6 +203,7 @@ class TestRenameSymbol:
 
         assert result["dry_run"]
         assert (temp_python_project / "src" / "utils.py").read_text() == original_content
+        assert not (temp_python_project / ".ropeproject").exists()
 
 
 class TestValidateImports:
@@ -224,6 +226,46 @@ class TestValidateImports:
         # Should find the broken import
         broken_errors = [e for e in errors if "broken.py" in e.get("file", "")]
         assert len(broken_errors) > 0
+
+    def test_detects_bare_broken_import(self, python_backend, temp_python_project):
+        """Should detect unresolved plain imports."""
+        (temp_python_project / "src" / "broken_import.py").write_text(
+            "import src.missing_module\n"
+        )
+
+        errors = python_backend.validate_imports(str(temp_python_project))
+
+        broken_errors = [e for e in errors if "broken_import.py" in e.get("file", "")]
+        assert len(broken_errors) > 0
+        assert broken_errors[0]["type"] == "unresolved_import"
+
+    def test_detects_missing_imported_name(self, python_backend, temp_python_project):
+        """Should detect missing imported names from local modules."""
+        (temp_python_project / "src" / "broken_name.py").write_text(
+            "from src.utils import missing_name\n"
+        )
+
+        errors = python_backend.validate_imports(str(temp_python_project))
+
+        broken_errors = [e for e in errors if "broken_name.py" in e.get("file", "")]
+        assert len(broken_errors) > 0
+        assert broken_errors[0]["type"] == "unresolved_import_name"
+        assert broken_errors[0]["name"] == "missing_name"
+
+    def test_detects_missing_external_imported_name(
+        self, python_backend, temp_python_project
+    ):
+        """Should detect missing imported names from source-backed external modules."""
+        (temp_python_project / "src" / "broken_external_name.py").write_text(
+            "from os import definitely_missing_name\n"
+        )
+
+        errors = python_backend.validate_imports(str(temp_python_project))
+
+        broken_errors = [e for e in errors if "broken_external_name.py" in e.get("file", "")]
+        assert len(broken_errors) > 0
+        assert broken_errors[0]["type"] == "unresolved_import_name"
+        assert broken_errors[0]["name"] == "definitely_missing_name"
 
     def test_detects_syntax_error(self, python_backend, temp_python_project):
         """Should detect syntax errors."""
@@ -249,6 +291,35 @@ from typing import List
 
         stdlib_errors = [e for e in errors if "with_stdlib.py" in e.get("file", "")]
         assert len(stdlib_errors) == 0
+
+    def test_relative_imports_in_nested_packages_are_valid(
+        self, python_backend, temp_python_project
+    ):
+        """Should resolve relative imports using package context."""
+        nested_pkg = temp_python_project / "src" / "nested"
+        nested_pkg.mkdir()
+        (nested_pkg / "__init__.py").write_text("")
+        (nested_pkg / "helpers.py").write_text("VALUE = 1\n")
+        (nested_pkg / "consumer.py").write_text("from .helpers import VALUE\n")
+
+        errors = python_backend.validate_imports(str(temp_python_project))
+
+        nested_errors = [e for e in errors if "nested/consumer.py" in e.get("file", "")]
+        assert nested_errors == []
+
+    def test_namespace_packages_are_valid(self, python_backend, temp_python_project):
+        """Should treat local namespace-package directories as importable modules."""
+        namespace_dir = temp_python_project / "namespace_pkg" / "nested"
+        namespace_dir.mkdir(parents=True)
+        (namespace_dir / "module.py").write_text("VALUE = 1\n")
+        (temp_python_project / "consumer.py").write_text(
+            "import namespace_pkg.nested.module\n"
+        )
+
+        errors = python_backend.validate_imports(str(temp_python_project))
+
+        namespace_errors = [e for e in errors if e.get("file") == "consumer.py"]
+        assert namespace_errors == []
 
 
 class TestEdgeCases:
