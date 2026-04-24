@@ -1,0 +1,39 @@
+{
+  "name": "refactory",
+  "version": "1.0.0",
+  "description": "Token-efficient codebase refactoring via MCP tools for Python and TypeScript projects.",
+  "author": {
+    "name": "sour4bh"
+  },
+  "homepage": "https://github.com/fntune/refactory",
+  "repository": "https://github.com/fntune/refactory",
+  "license": "MIT",
+  "keywords": [
+    "refactoring",
+    "imports",
+    "reorganization",
+    "rope",
+    "typescript"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json",
+  "mcpServers": "./.mcp.codex.json",
+  "interface": {
+    "displayName": "Refactory",
+    "shortDescription": "Refactor Python and TypeScript code through MCP tools.",
+    "longDescription": "Refactory provides Codex with token-efficient refactoring tools for moving modules, moving symbols, renaming symbols, and validating imports across Python and TypeScript projects.",
+    "developerName": "sour4bh",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/fntune/refactory",
+    "defaultPrompt": [
+      "Move this module and update imports.",
+      "Rename this symbol across the project.",
+      "Validate imports after refactoring."
+    ],
+    "brandColor": "#2563EB"
+  }
+}
