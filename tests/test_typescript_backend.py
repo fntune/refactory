@@ -90,6 +90,7 @@ class TestMoveModule:
 
         assert result["success"]
         assert result["dry_run"]
+        assert "preview" in result
         # Original file should still exist
         assert (temp_typescript_project / "src" / "db.ts").exists()
 
@@ -104,6 +105,107 @@ class TestMoveModule:
 
         assert "affected_files" in result
         assert len(result["affected_files"]) > 0
+        assert "src/storage/db.ts" in result["affected_files"]
+
+    def test_move_module_updates_directory_requires_to_index(
+        self, typescript_backend, tmp_path
+    ):
+        """Directory-style require paths should resolve to index files."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "db").mkdir()
+        (project / "src" / "db" / "index.ts").write_text("export const value = 1;\n")
+        (project / "src" / "consumer.ts").write_text(
+            'const { value } = require("./db");\n'
+            "export const output = value;\n"
+        )
+
+        result = typescript_backend.move_module(
+            source="src/db/index.ts",
+            target="src/core/db/index.ts",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        consumer = (project / "src" / "consumer.ts").read_text()
+        assert 'require("./core/db/index")' in consumer
+        assert "src/consumer.ts" in result["affected_files"]
+
+    def test_move_module_rejects_identical_paths(self, typescript_backend, temp_typescript_project):
+        """Moving a module onto itself should fail closed."""
+        with pytest.raises(Exception, match="identical"):
+            typescript_backend.move_module(
+                source="src/db.ts",
+                target="src/db.ts",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+
+    def test_move_module_overwrites_existing_target(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """overwrite=True should replace an existing distinct target file."""
+        target = temp_typescript_project / "src" / "storage"
+        target.mkdir()
+        (target / "db.ts").write_text("export const BROKEN = true;\n")
+
+        result = typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=False,
+            overwrite=True,
+        )
+
+        assert result["success"]
+        moved = (temp_typescript_project / "src" / "storage" / "db.ts").read_text()
+        assert "class Database" in moved
+        assert "BROKEN" not in moved
+
+    def test_move_module_dry_run_overwrite_preserves_existing_target(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """dry_run with overwrite=True should not delete or replace the target."""
+        target = temp_typescript_project / "src" / "storage"
+        target.mkdir()
+        target_file = target / "db.ts"
+        original_target = "export const BROKEN = true;\n"
+        target_file.write_text(original_target)
+
+        result = typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(temp_typescript_project),
+            dry_run=True,
+            overwrite=True,
+        )
+
+        assert result["success"]
+        assert result["dry_run"]
+        assert "preview" in result
+        assert "src/storage/db.ts" in result["affected_files"]
+        assert target_file.read_text() == original_target
+        assert (temp_typescript_project / "src" / "db.ts").exists()
+
+    def test_move_module_preserves_js_suffix_in_nodenext(
+        self, typescript_backend, temp_typescript_nodenext_project
+    ):
+        """Existing .js specifiers should survive rewrites in NodeNext projects."""
+        result = typescript_backend.move_module(
+            source="src/utils.ts",
+            target="src/core/utils.ts",
+            project_root=str(temp_typescript_nodenext_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        main_content = (temp_typescript_nodenext_project / "src" / "main.ts").read_text()
+        assert './core/utils.js' in main_content
 
 
 class TestMoveSymbol:
@@ -292,8 +394,111 @@ class TestMoveSymbol:
         )
 
         assert result["success"]
+        assert result["dry_run"]
+        assert "preview" in result
         # Original should be unchanged
         assert (temp_typescript_project / "src" / "utils.ts").read_text() == original_utils
+
+    def test_move_symbol_rejects_same_file(self, typescript_backend, temp_typescript_project):
+        """Moving a symbol within the same file should fail closed."""
+        with pytest.raises(Exception, match="identical"):
+            typescript_backend.move_symbol(
+                source_file="src/utils.ts",
+                symbol_name="helperFunc",
+                target_file="src/utils.ts",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+
+    def test_move_symbol_rejects_target_binding_collision(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """Existing target bindings should block a move."""
+        (temp_typescript_project / "src" / "helpers.ts").write_text(
+            "export const helperFunc = 1;\n"
+        )
+
+        with pytest.raises(Exception, match="already has a binding"):
+            typescript_backend.move_symbol(
+                source_file="src/utils.ts",
+                symbol_name="helperFunc",
+                target_file="src/helpers.ts",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+
+    def test_move_symbol_rejects_unexported_dependencies(
+        self, typescript_backend, tmp_path
+    ):
+        """Source-local dependencies should trigger a fail-closed error."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "source.ts").write_text(
+            "const secret = 1;\n"
+            "export function helper(): number {\n"
+            "    return secret;\n"
+            "}\n"
+        )
+        (project / "src" / "target.ts").write_text("")
+
+        with pytest.raises(Exception, match="exported first: secret"):
+            typescript_backend.move_symbol(
+                source_file="src/source.ts",
+                symbol_name="helper",
+                target_file="src/target.ts",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+    def test_move_symbol_rejects_multi_declarator_variable(
+        self, typescript_backend, tmp_path
+    ):
+        """One declarator out of a multi-declarator statement should fail closed."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "source.ts").write_text("export const a = 1, b = 2;\n")
+        (project / "src" / "target.ts").write_text("")
+
+        with pytest.raises(Exception, match="multi-declarator"):
+            typescript_backend.move_symbol(
+                source_file="src/source.ts",
+                symbol_name="a",
+                target_file="src/target.ts",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+    def test_move_symbol_allows_type_contextual_identifier(
+        self, typescript_backend, tmp_path
+    ):
+        """TypeScript contextual keywords such as type can be bindings."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "source.ts").write_text("export const type = 1;\n")
+        (project / "src" / "target.ts").write_text("")
+
+        result = typescript_backend.move_symbol(
+            source_file="src/source.ts",
+            symbol_name="type",
+            target_file="src/target.ts",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        assert "const type = 1" in (project / "src" / "target.ts").read_text()
 
 
 class TestRenameSymbol:
@@ -339,7 +544,7 @@ class TestRenameSymbol:
         """Dry run should not modify files."""
         original = (temp_typescript_project / "src" / "utils.ts").read_text()
 
-        typescript_backend.rename_symbol(
+        result = typescript_backend.rename_symbol(
             file="src/utils.ts",
             old_name="helperFunc",
             new_name="assistFunc",
@@ -347,7 +552,106 @@ class TestRenameSymbol:
             dry_run=True,
         )
 
+        assert result["success"]
+        assert result["dry_run"]
+        assert "preview" in result
         assert (temp_typescript_project / "src" / "utils.ts").read_text() == original
+
+    def test_rename_updates_callers_without_tsconfig(
+        self, typescript_backend, temp_typescript_no_tsconfig_project
+    ):
+        """rename_symbol should operate on the full project graph without tsconfig."""
+        result = typescript_backend.rename_symbol(
+            file="src/utils.ts",
+            old_name="helperFunc",
+            new_name="assistFunc",
+            project_root=str(temp_typescript_no_tsconfig_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        main_content = (temp_typescript_no_tsconfig_project / "src" / "main.ts").read_text()
+        assert "assistFunc" in main_content
+        assert "helperFunc" not in main_content
+
+    def test_rename_parameter_requires_selector_when_ambiguous(
+        self, typescript_backend, tmp_path
+    ):
+        """Duplicate parameter names should require a selector."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "params.ts").write_text(
+            "export function greet(name: string) { return name; }\n"
+            "export function other(name: string) { return name; }\n"
+        )
+
+        with pytest.raises(Exception, match="ambiguous"):
+            typescript_backend.rename_symbol(
+                file="src/params.ts",
+                old_name="name",
+                new_name="person",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+    def test_rename_parameter_with_selector(self, typescript_backend, tmp_path):
+        """Selectors should target one parameter declaration precisely."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "params.ts").write_text(
+            "export function greet(name: string) { return name; }\n"
+            "export function other(name: string) { return name; }\n"
+        )
+
+        result = typescript_backend.rename_symbol(
+            file="src/params.ts",
+            old_name="name",
+            new_name="person",
+            project_root=str(project),
+            dry_run=False,
+            line=1,
+            column=23,
+        )
+
+        assert result["success"]
+        content = (project / "src" / "params.ts").read_text()
+        assert "greet(person: string)" in content
+        assert "return person;" in content
+        assert "other(name: string)" in content
+
+    def test_rename_to_type_contextual_identifier(self, typescript_backend, tmp_path):
+        """TypeScript contextual keywords should be valid rename targets."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "values.ts").write_text(
+            "export const value = 1;\n"
+            "export const output = value;\n"
+        )
+
+        result = typescript_backend.rename_symbol(
+            file="src/values.ts",
+            old_name="value",
+            new_name="type",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        content = (project / "src" / "values.ts").read_text()
+        assert "const type = 1" in content
+        assert "output = type" in content
 
 
 class TestValidateImports:
@@ -366,6 +670,7 @@ class TestValidateImports:
 
         errors = typescript_backend.validate_imports(str(temp_typescript_project))
         assert len(errors) > 0
+        assert all("code" in error for error in errors)
 
 
 class TestEdgeCases:

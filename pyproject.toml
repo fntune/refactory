@@ -19,6 +19,10 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["server"]
+filterwarnings = [
+    "ignore:Please use `import python_multipart` instead\\.:PendingDeprecationWarning:starlette\\.formparsers",
+    "ignore:Delete once deprecated functions are gone:DeprecationWarning:rope\\.base\\.project",
+]
 
 [tool.pyright]
 pythonVersion = "3.10"

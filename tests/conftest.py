@@ -153,6 +153,62 @@ export class Database {
 
 
 @pytest.fixture
+def temp_typescript_no_tsconfig_project(tmp_path):
+    """Create a hermetic TypeScript project without a tsconfig."""
+    project = tmp_path / "tsproject-no-tsconfig"
+    project.mkdir()
+    (project / "src").mkdir()
+
+    (project / "src" / "main.ts").write_text(
+        'import { helperFunc } from "./utils";\n'
+        "export const value = helperFunc();\n"
+    )
+    (project / "src" / "utils.ts").write_text(
+        "export function helperFunc(): string {\n"
+        '    return "helped";\n'
+        "}\n"
+    )
+
+    yield project
+
+    shutil.rmtree(project, ignore_errors=True)
+
+
+@pytest.fixture
+def temp_typescript_nodenext_project(tmp_path):
+    """Create a hermetic NodeNext TypeScript project with explicit .js imports."""
+    project = tmp_path / "tsproject-nodenext"
+    project.mkdir()
+
+    (project / "tsconfig.json").write_text("""{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "NodeNext",
+    "strict": true,
+    "rootDir": "./src",
+    "outDir": "./dist"
+  },
+  "include": ["src/**/*"]
+}
+""")
+
+    (project / "src").mkdir()
+    (project / "src" / "main.ts").write_text(
+        'import { helperFunc } from "./utils.js";\n'
+        "export const value = helperFunc();\n"
+    )
+    (project / "src" / "utils.ts").write_text(
+        "export function helperFunc(): string {\n"
+        '    return "helped";\n'
+        "}\n"
+    )
+
+    yield project
+
+    shutil.rmtree(project, ignore_errors=True)
+
+
+@pytest.fixture
 def python_backend():
     """Get Python refactoring backend."""
     from backends.python import PythonBackend

@@ -2,8 +2,7 @@
 """
 Refactory MCP Server - Token-efficient codebase refactoring tools.
 
-Provides move_module, move_symbol, rename_symbol, validate_imports tools
-that Claude can call directly instead of manual Edit operations.
+Provides shared cross-language tools plus Python-only Rope extras.
 """
 import json
 import logging
@@ -17,6 +16,7 @@ from mcp.types import Tool, TextContent
 
 from backends.python import PythonBackend
 from backends.typescript import TypeScriptBackend
+from validation import validate_position_selector
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("refactory")
@@ -81,6 +81,11 @@ async def list_tools() -> list[Tool]:
                         "description": "Preview changes without applying them",
                         "default": False,
                     },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Overwrite an existing target file if it already exists",
+                        "default": False,
+                    },
                 },
                 "required": ["source", "target"],
             },
@@ -143,13 +148,21 @@ async def list_tools() -> list[Tool]:
                         "description": "Preview changes without applying them",
                         "default": False,
                     },
+                    "line": {
+                        "type": "integer",
+                        "description": "1-based declaration line for disambiguating parameter renames",
+                    },
+                    "column": {
+                        "type": "integer",
+                        "description": "1-based declaration column for disambiguating parameter renames",
+                    },
                 },
                 "required": ["file", "old_name", "new_name"],
             },
         ),
         Tool(
             name="validate_imports",
-            description="Check for broken imports in the codebase after refactoring. Returns list of files with import errors.",
+            description="Check for refactor-related import and name-resolution errors after restructuring. This is a narrow safety probe, not a full compiler or linter run.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -165,6 +178,121 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="organize_imports",
+            description="Python-only: organize imports in a Python module using Rope.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Python file whose imports should be organized",
+                    },
+                    "project_root": {
+                        "type": "string",
+                        "description": "Root directory of the project (defaults to cwd)",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview changes without applying them",
+                        "default": False,
+                    },
+                },
+                "required": ["file"],
+            },
+        ),
+        Tool(
+            name="extract_variable",
+            description="Python-only: extract the selected expression into a variable using Rope.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Python file containing the selection"},
+                    "new_name": {"type": "string", "description": "Name of the extracted variable"},
+                    "start_line": {"type": "integer", "description": "1-based start line"},
+                    "start_column": {"type": "integer", "description": "1-based start column"},
+                    "end_line": {"type": "integer", "description": "1-based end line"},
+                    "end_column": {
+                        "type": "integer",
+                        "description": "1-based end column (exclusive)",
+                    },
+                    "project_root": {
+                        "type": "string",
+                        "description": "Root directory of the project (defaults to cwd)",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview changes without applying them",
+                        "default": False,
+                    },
+                },
+                "required": [
+                    "file",
+                    "new_name",
+                    "start_line",
+                    "start_column",
+                    "end_line",
+                    "end_column",
+                ],
+            },
+        ),
+        Tool(
+            name="extract_function",
+            description="Python-only: extract the selected statements into a function using Rope.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Python file containing the selection"},
+                    "new_name": {"type": "string", "description": "Name of the extracted function"},
+                    "start_line": {"type": "integer", "description": "1-based start line"},
+                    "start_column": {"type": "integer", "description": "1-based start column"},
+                    "end_line": {"type": "integer", "description": "1-based end line"},
+                    "end_column": {
+                        "type": "integer",
+                        "description": "1-based end column (exclusive)",
+                    },
+                    "project_root": {
+                        "type": "string",
+                        "description": "Root directory of the project (defaults to cwd)",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview changes without applying them",
+                        "default": False,
+                    },
+                },
+                "required": [
+                    "file",
+                    "new_name",
+                    "start_line",
+                    "start_column",
+                    "end_line",
+                    "end_column",
+                ],
+            },
+        ),
+        Tool(
+            name="inline_symbol",
+            description="Python-only: inline a selected local variable, parameter, or function using Rope.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Python file containing the symbol reference"},
+                    "line": {"type": "integer", "description": "1-based line containing the symbol"},
+                    "column": {"type": "integer", "description": "1-based column containing the symbol"},
+                    "project_root": {
+                        "type": "string",
+                        "description": "Root directory of the project (defaults to cwd)",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview changes without applying them",
+                        "default": False,
+                    },
+                },
+                "required": ["file", "line", "column"],
+            },
+        ),
     ]
 
 
@@ -178,9 +306,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         if name == "move_module":
             source = arguments["source"]
             target = arguments["target"]
+            overwrite = arguments.get("overwrite", False)
             language = detect_language(source)
             backend = get_backend(language)
-            result = backend.move_module(source, target, project_root, dry_run)
+            result = backend.move_module(source, target, project_root, dry_run, overwrite=overwrite)
 
         elif name == "move_symbol":
             source_file = arguments["source_file"]
@@ -194,9 +323,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             file = arguments["file"]
             old_name = arguments["old_name"]
             new_name = arguments["new_name"]
+            line, column = validate_position_selector(
+                arguments.get("line"),
+                arguments.get("column"),
+            )
             language = detect_language(file)
             backend = get_backend(language)
-            result = backend.rename_symbol(file, old_name, new_name, project_root, dry_run)
+            result = backend.rename_symbol(
+                file,
+                old_name,
+                new_name,
+                project_root,
+                dry_run,
+                line=line,
+                column=column,
+            )
 
         elif name == "validate_imports":
             language = arguments.get("language")
@@ -208,6 +349,50 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 if lang_result:
                     results.append({"language": lang, "errors": lang_result})
             result = {"valid": len(results) == 0, "issues": results}
+
+        elif name == "organize_imports":
+            backend = get_backend("python")
+            result = backend.organize_imports(
+                arguments["file"],
+                project_root,
+                dry_run,
+            )
+
+        elif name == "extract_variable":
+            backend = get_backend("python")
+            result = backend.extract_variable(
+                file=arguments["file"],
+                new_name=arguments["new_name"],
+                start_line=arguments["start_line"],
+                start_column=arguments["start_column"],
+                end_line=arguments["end_line"],
+                end_column=arguments["end_column"],
+                project_root=project_root,
+                dry_run=dry_run,
+            )
+
+        elif name == "extract_function":
+            backend = get_backend("python")
+            result = backend.extract_function(
+                file=arguments["file"],
+                new_name=arguments["new_name"],
+                start_line=arguments["start_line"],
+                start_column=arguments["start_column"],
+                end_line=arguments["end_line"],
+                end_column=arguments["end_column"],
+                project_root=project_root,
+                dry_run=dry_run,
+            )
+
+        elif name == "inline_symbol":
+            backend = get_backend("python")
+            result = backend.inline_symbol(
+                file=arguments["file"],
+                line=arguments["line"],
+                column=arguments["column"],
+                project_root=project_root,
+                dry_run=dry_run,
+            )
 
         else:
             raise ValueError(f"Unknown tool: {name}")

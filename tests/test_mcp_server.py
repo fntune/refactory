@@ -24,6 +24,10 @@ class TestToolListing:
         assert "move_symbol" in tool_names
         assert "rename_symbol" in tool_names
         assert "validate_imports" in tool_names
+        assert "organize_imports" in tool_names
+        assert "extract_variable" in tool_names
+        assert "extract_function" in tool_names
+        assert "inline_symbol" in tool_names
 
     @pytest.mark.asyncio
     async def test_tool_schemas_valid(self):
@@ -50,10 +54,23 @@ class TestToolListing:
         assert "target" in props
         assert "project_root" in props
         assert "dry_run" in props
+        assert "overwrite" in props
 
         required = move_module.inputSchema["required"]
         assert "source" in required
         assert "target" in required
+
+    @pytest.mark.asyncio
+    async def test_rename_symbol_schema(self):
+        """rename_symbol should expose selector fields."""
+        from main import list_tools
+
+        tools = await list_tools()
+        rename_symbol = next(t for t in tools if t.name == "rename_symbol")
+
+        props = rename_symbol.inputSchema["properties"]
+        assert "line" in props
+        assert "column" in props
 
 
 class TestToolExecution:
@@ -92,6 +109,36 @@ class TestToolExecution:
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["success"]
+
+    @pytest.mark.asyncio
+    async def test_rename_parameter_execution_with_selector(self, tmp_path):
+        """rename_symbol should thread selector-based parameter renames."""
+        from main import call_tool
+
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "params.py").write_text(
+            "def greet(name):\n"
+            "    return name\n\n"
+            "def other(name):\n"
+            "    return name\n"
+        )
+
+        result = await call_tool("rename_symbol", {
+            "file": "params.py",
+            "old_name": "name",
+            "new_name": "person",
+            "project_root": str(project),
+            "dry_run": False,
+            "line": 1,
+            "column": 11,
+        })
+
+        data = json.loads(result[0].text)
+        assert data["success"]
+        content = (project / "params.py").read_text()
+        assert "def greet(person):" in content
+        assert "def other(name):" in content
 
     @pytest.mark.asyncio
     async def test_validate_imports_execution(self, temp_python_project):
@@ -239,7 +286,6 @@ class TestDryRunMode:
         # File should not have moved
         assert (temp_python_project / "src" / "db.py").exists()
         assert not (temp_python_project / "src" / "storage").exists()
-        assert not (temp_python_project / ".ropeproject").exists()
 
     @pytest.mark.asyncio
     async def test_dry_run_reports_changes(self, temp_python_project):
@@ -257,3 +303,4 @@ class TestDryRunMode:
         data = json.loads(result[0].text)
         assert "affected_files" in data
         assert len(data["affected_files"]) > 0
+        assert "preview" in data

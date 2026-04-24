@@ -12,16 +12,25 @@ Instead of manually hunting down every import after moving a file, Claude calls 
 
 ## What it does
 
-Refactory exposes four MCP tools that Claude Code can call directly during refactoring sessions:
+Refactory exposes four shared MCP tools plus Python-only Rope extras that Claude Code can call directly during refactoring sessions:
 
 | Tool | Description |
 |------|-------------|
-| `move_module` | Move a file to a new location, rewrite all imports pointing to it |
-| `move_symbol` | Extract a function or class to another module, update all references |
-| `rename_symbol` | Rename an identifier across the entire codebase |
-| `validate_imports` | Scan for broken imports after restructuring |
+| `move_module` | Move a file to a new location, rewrite all imports pointing to it, and optionally overwrite an existing target |
+| `move_symbol` | Extract a function, class, or variable to another module, update all references, and fail closed on unsafe moves |
+| `rename_symbol` | Rename an identifier across the entire codebase, including parameters when you disambiguate with `line` / `column` if needed |
+| `validate_imports` | Run a narrow refactor-safety scan for broken imports and unresolved exported names after restructuring |
 
-Every tool supports **dry-run mode** — Claude can preview the full diff before committing any changes.
+Python-only tools:
+
+| Tool | Description |
+|------|-------------|
+| `organize_imports` | Organize imports in a Python module using Rope |
+| `extract_variable` | Extract a selected Python expression into a variable |
+| `extract_function` | Extract selected Python statements into a function |
+| `inline_symbol` | Inline a selected Python local variable, parameter, or function |
+
+Every tool supports **dry-run mode** — Claude can preview the full diff before committing any code changes. Python dry-runs now use Rope's native change descriptions instead of copying the whole repo to a temporary project.
 
 ---
 
@@ -35,7 +44,7 @@ When you ask Claude to move `src/utils.py` to `src/core/utils.py` without toolin
 With refactory, Claude calls one tool:
 ```
 move_module("src/utils.py", "src/core/utils.py")
-→ { success: true, changedFiles: ["src/api.py", "src/db.py", "tests/test_utils.py", ...] }
+→ { success: true, affected_files: ["src/api.py", "src/db.py", "tests/test_utils.py", ...] }
 ```
 
 Batch operations run in parallel — move three modules in the same turn.
@@ -88,7 +97,13 @@ move_module("src/utils.py", "src/core/utils.py", dry_run=True)
 
 # Apply it
 move_module("src/utils.py", "src/core/utils.py")
-→ { success: true, changedFiles: ["src/api.py", "tests/test_utils.py"] }
+→ { success: true, affected_files: ["src/api.py", "tests/test_utils.py"] }
+
+# Replace an existing destination explicitly
+move_module("src/db.py", "src/storage/db.py", overwrite=True)
+
+# Rename an ambiguous parameter by declaration location
+rename_symbol("src/api.py", "name", "account_name", line=12, column=19)
 
 # Batch: move multiple modules in one turn (parallel tool calls)
 move_module("src/db.py", "src/storage/db.py")
@@ -138,3 +153,9 @@ Tests use hermetic fixtures — each test gets an isolated temporary project, so
 ```
 
 Test coverage: `move_module`, `move_symbol`, `rename_symbol`, `validate_imports` — plus dry-run, error cases, and path escaping protection.
+
+## Notes
+
+- `validate_imports` is a refactor-safety probe, not a full compiler or linter run. It stays conservative when a missing exported name cannot be proven statically.
+- `move_symbol` now fails closed on ambiguous or destructive cases such as same-file moves, target binding collisions, multi-declarator variables, and source-local dependencies that are not safely importable after the move.
+- Python `move_symbol` dry-run requires the target module to already exist on disk. Rope cannot compute an exact import-rewrite preview against a module it cannot read, and refactory refuses to fabricate or stage one. Create the destination file first (an empty file is fine) or run without `dry_run`.
