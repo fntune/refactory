@@ -3,6 +3,7 @@ import ast
 import importlib.machinery
 import importlib.util
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,24 @@ from validation import validate_identifier, validate_position_selector
 
 logger = logging.getLogger("refactory.python")
 
+SCAN_SKIP_DIR_NAMES = frozenset({
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    "build",
+    "dist",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ropeproject",
+    "node_modules",
+    "site-packages",
+    ".eggs",
+})
+
 
 class PythonBackend:
     """Python refactoring using Rope library."""
@@ -29,6 +48,15 @@ class PythonBackend:
         resolved = (root / path).resolve()
         if not resolved.is_relative_to(root):
             raise ValueError(f"Path '{path}' escapes project root")
+        return resolved
+
+    def _validate_source_path(self, path: str, project_root: str) -> Path:
+        """Validate path stays within project root and refers to an existing file."""
+        resolved = self._validate_path(path, project_root)
+        if not resolved.exists():
+            raise ValueError(f"source file not found: {path}")
+        if not resolved.is_file():
+            raise ValueError(f"source path is not a file: {path}")
         return resolved
 
     def _validate_module_path(self, file_path: str) -> None:
@@ -54,6 +82,55 @@ class PythonBackend:
         project = Project(str(root))
         project.validate(project.root)
         return project
+
+    def _git_worktree_root(self, path: Path) -> Path | None:
+        """Return the git worktree root containing path, or None outside git."""
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return Path(result.stdout.strip()).resolve()
+
+    def _prepare_project_root(
+        self,
+        project_root: str,
+        expected_git_root: str | None,
+    ) -> tuple[Path, Path | None]:
+        """Resolve project_root and verify it belongs to the expected worktree."""
+        root = Path(project_root).expanduser().resolve()
+        if not root.exists():
+            raise ValueError(f"Project root does not exist: {project_root}")
+
+        git_root = self._git_worktree_root(root)
+        if expected_git_root is None:
+            return root, git_root
+
+        expected = Path(expected_git_root).expanduser().resolve()
+        if not expected.exists():
+            raise ValueError(f"expected_git_root does not exist: {expected_git_root}")
+        if git_root is None:
+            raise ValueError(
+                f"project_root '{root}' is not inside a git worktree, "
+                f"but expected_git_root was set to '{expected}'"
+            )
+        if git_root != expected:
+            raise ValueError(
+                f"project_root '{root}' belongs to git worktree '{git_root}', "
+                f"not expected_git_root '{expected}'"
+            )
+        if not root.is_relative_to(expected):
+            raise ValueError(
+                f"project_root '{root}' is not inside expected_git_root '{expected}'"
+            )
+        return root, git_root
 
     def _relative_path(self, path: Path, root: Path) -> str:
         return path.resolve().relative_to(root).as_posix()
@@ -282,7 +359,7 @@ class PythonBackend:
                 change = CreateFolder(current, part)
                 preview_parts.append(change.get_description())
                 if apply_staging:
-                    project.do(change)
+                    self._do(project, root, change)
                     applied_count += 1
                     child = project.get_resource(child_rel)
                 else:
@@ -298,7 +375,7 @@ class PythonBackend:
                 change = CreateFile(child, "__init__.py")
                 preview_parts.append(change.get_description())
                 if apply_staging:
-                    project.do(change)
+                    self._do(project, root, change)
                     applied_count += 1
                 created_init_paths.append(init_rel)
 
@@ -330,7 +407,7 @@ class PythonBackend:
             change = CreateFile(folder_resource, file_path.name)
             preview_parts.append(change.get_description())
             if apply_staging:
-                project.do(change)
+                self._do(project, root, change)
                 applied_count += 1
                 resource = project.get_resource(rel_path)
             else:
@@ -352,9 +429,34 @@ class PythonBackend:
             return [], 0
         change = RemoveResource(resource)
         if apply_staging:
-            project.do(change)
+            self._do(project, root, change)
             return [change.get_description()], 1
         return [change.get_description()], 0
+
+    def _resource_path(self, project, resource: Any) -> Path:
+        path = getattr(resource, "path", "")
+        project_root = Path(project.address).resolve()
+        if not path:
+            return project_root
+        return (project_root / path).resolve()
+
+    def _assert_change_inside_project_root(self, project, root: Path, change: Any) -> None:
+        """Refuse to apply a Rope Change that targets files outside project_root."""
+        outside: list[str] = []
+        for resource in change.get_changed_resources():
+            resource_path = self._resource_path(project, resource)
+            if not resource_path.is_relative_to(root):
+                outside.append(str(resource_path))
+        if outside:
+            formatted = "\n".join(f"  {path}" for path in outside)
+            raise ValueError(
+                f"Refusing to apply Rope change outside project_root '{root}':\n"
+                f"{formatted}"
+            )
+
+    def _do(self, project, root: Path, change: Any) -> None:
+        self._assert_change_inside_project_root(project, root, change)
+        project.do(change)
 
     def _collect_changed_python_files(self, *changes: Any) -> list[str]:
         """Collect changed Python files from Rope Change objects."""
@@ -393,7 +495,7 @@ class PythonBackend:
         apply_staging: bool,
     ) -> tuple[Any, Any | None, list[str], list[str], int]:
         """Prepare Rope changes for moving a module."""
-        source_path = self._validate_path(source, str(root))
+        source_path = self._validate_source_path(source, str(root))
         target_path = self._validate_path(target, str(root))
         self._validate_module_path(target)
         if source_path == target_path:
@@ -432,7 +534,7 @@ class PythonBackend:
         rename_changes = None
         if source_path.stem != target_path.stem:
             if apply_staging:
-                project.do(move_changes)
+                self._do(project, root, move_changes)
                 applied_count += 1
                 moved_rel = self._relative_path(target_path.parent / f"{source_path.stem}.py", root)
                 moved_resource = project.get_resource(moved_rel)
@@ -506,6 +608,269 @@ class PythonBackend:
     def _module_exists_externally(self, module_name: str) -> bool:
         """Check whether a module resolves outside the project."""
         return self._module_spec(module_name) is not None
+
+    def _should_skip_scan_path(self, py_file: Path, root: Path) -> bool:
+        """True if py_file should be excluded from project-wide scans."""
+        try:
+            rel = py_file.resolve().relative_to(root.resolve())
+        except (ValueError, OSError):
+            return True
+        for part in rel.parts[:-1]:
+            if part in SCAN_SKIP_DIR_NAMES:
+                return True
+            if part.endswith(".egg-info"):
+                return True
+        return False
+
+    def _iter_project_python_files(self, root: Path):
+        """Yield project .py files honoring the standard skip set."""
+        for py_file in root.rglob("*.py"):
+            if self._should_skip_scan_path(py_file, root):
+                continue
+            yield py_file
+
+    def _git_tracked_python_files(self, root: Path) -> list[Path] | None:
+        """Return tracked and untracked-but-unignored .py files, or None.
+
+        Uses ``git ls-files`` so the result respects ``.gitignore`` and naturally
+        skips vendored / build / worktree contents. Submodules are not recursed
+        (they are treated as external code). Returns ``None`` when the directory
+        is not a git working tree or when ``git`` is unavailable.
+        """
+        git_root = self._git_worktree_root(root)
+        if git_root is None:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(git_root),
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "*.py",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        stdout = result.stdout
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        entries = [entry for entry in stdout.split("\x00") if entry]
+        paths = []
+        for entry in entries:
+            path = (git_root / entry).resolve()
+            if path.is_relative_to(root):
+                paths.append(path)
+        return paths
+
+    def _project_python_files_for_scan(self, root: Path):
+        """Yield project .py files, preferring git-tracked files when available.
+
+        Inside a git repo we use ``git ls-files`` so ``.gitignore`` rules,
+        ``.git/worktrees/``, and vendored trees are all honored automatically.
+        Outside a git repo we fall back to the rglob walk with the standard
+        skip set. The skip set is applied in both modes as defense in depth.
+        """
+        git_files = self._git_tracked_python_files(root)
+        if git_files is not None:
+            for py_file in git_files:
+                if self._should_skip_scan_path(py_file, root):
+                    continue
+                if not py_file.exists():
+                    continue
+                yield py_file
+            return
+        yield from self._iter_project_python_files(root)
+
+    def _same_file(self, a: Path, b: Path) -> bool:
+        try:
+            return a.resolve() == b.resolve()
+        except OSError:
+            return False
+
+    def _format_import_from(self, node: ast.ImportFrom) -> str:
+        dots = "." * node.level
+        module = node.module or ""
+        names = ", ".join(
+            f"{alias.name} as {alias.asname}" if alias.asname else alias.name
+            for alias in node.names
+        )
+        return f"from {dots}{module} import {names}"
+
+    def _find_lazy_imports_of(
+        self,
+        py_file: Path,
+        root: Path,
+        target_source_path: Path,
+        *,
+        symbol_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return in-function imports in py_file whose target resolves to target_source_path.
+
+        When ``symbol_name`` is provided the filter is narrowed to imports that
+        specifically reference that symbol (e.g. ``from source import symbol``).
+        Unrelated lazy imports of the same source module are ignored, because
+        Rope's ``move_symbol`` only rewrites the moved name — other symbols
+        from the module continue to resolve to their original location.
+        """
+        try:
+            tree = ast.parse(py_file.read_text(errors="replace"))
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            return []
+
+        hits: list[dict[str, Any]] = []
+
+        def visit(node: ast.AST, inside_function: bool) -> None:
+            is_function = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+
+            if inside_function:
+                if isinstance(node, ast.Import):
+                    if symbol_name is None:
+                        for alias in node.names:
+                            resolved = self._find_local_module(root, alias.name.split("."))
+                            if resolved and self._same_file(resolved, target_source_path):
+                                as_clause = f" as {alias.asname}" if alias.asname else ""
+                                hits.append({
+                                    "line": node.lineno,
+                                    "text": f"import {alias.name}{as_clause}",
+                                })
+                elif isinstance(node, ast.ImportFrom):
+                    module_parts = self._resolve_import_parts(py_file, root, node.module, node.level)
+                    if module_parts is not None:
+                        matched = False
+                        module_file = self._find_local_module(root, module_parts)
+                        module_is_target = (
+                            module_file is not None
+                            and self._same_file(module_file, target_source_path)
+                        )
+                        if module_is_target:
+                            if symbol_name is None:
+                                hits.append({
+                                    "line": node.lineno,
+                                    "text": self._format_import_from(node),
+                                })
+                                matched = True
+                            elif any(alias.name == symbol_name for alias in node.names):
+                                hits.append({
+                                    "line": node.lineno,
+                                    "text": self._format_import_from(node),
+                                })
+                                matched = True
+                        if symbol_name is None and not matched:
+                            for alias in node.names:
+                                if alias.name == "*":
+                                    continue
+                                sub_file = self._find_local_module(
+                                    root, module_parts + [alias.name]
+                                )
+                                if sub_file and self._same_file(sub_file, target_source_path):
+                                    hits.append({
+                                        "line": node.lineno,
+                                        "text": self._format_import_from(node),
+                                    })
+                                    break
+
+            for child in ast.iter_child_nodes(node):
+                visit(child, inside_function or is_function)
+
+        visit(tree, False)
+        return hits
+
+    def _find_basename_collision(self, source_path: Path) -> dict[str, Any] | None:
+        """Return info about a top-level binding named same as source stem, or None."""
+        stem = source_path.stem
+        try:
+            tree = ast.parse(source_path.read_text(errors="replace"))
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            return None
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == stem:
+                return {"line": node.lineno, "binding": stem, "kind": "function"}
+            if isinstance(node, ast.ClassDef) and node.name == stem:
+                return {"line": node.lineno, "binding": stem, "kind": "class"}
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == stem:
+                        return {"line": node.lineno, "binding": stem, "kind": "variable"}
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                    and node.target.id == stem:
+                return {"line": node.lineno, "binding": stem, "kind": "variable"}
+        return None
+
+    def _check_rope_hazards(
+        self,
+        source_path: Path,
+        root: Path,
+        operation: str,
+        *,
+        symbol_name: str | None = None,
+    ) -> None:
+        """Fail closed when the source file pattern would cause Rope to corrupt output.
+
+        Two known Rope hazards trigger here:
+        - E1: in-function (lazy) imports referencing the source module (or, for
+              move_symbol, the specific symbol) get silently hoisted to module
+              top by Rope, breaking any circular-import workarounds.
+        - E2: a top-level binding whose name equals the source file's stem causes
+              Rope to confuse variable attribute access (``foo.method()``) with
+              module attribute access when rewriting consumers.
+
+        Both hazards are Rope internals; the correct behavior is to refuse the move
+        with an actionable message rather than proceed and silently corrupt consumers.
+        """
+        rel_source = source_path.resolve().relative_to(root.resolve()).as_posix()
+
+        collision = self._find_basename_collision(source_path)
+        if collision is not None:
+            raise ValueError(
+                f"{operation} cannot safely move '{rel_source}' — it exports a "
+                f"top-level {collision['kind']} '{collision['binding']}' "
+                f"(line {collision['line']}) with the same name as the module. "
+                f"The refactor would corrupt "
+                f"'{collision['binding']}.method()' calls in consumers. Rename the "
+                f"{collision['kind']} first, then retry."
+            )
+
+        lazy_hits: list[dict[str, Any]] = []
+        for py_file in self._iter_project_python_files(root):
+            if self._same_file(py_file, source_path):
+                continue
+            for hit in self._find_lazy_imports_of(
+                py_file, root, source_path, symbol_name=symbol_name
+            ):
+                lazy_hits.append({
+                    "file": py_file.resolve().relative_to(root.resolve()).as_posix(),
+                    **hit,
+                })
+
+        if lazy_hits:
+            sample = lazy_hits[:20]
+            formatted = "\n".join(
+                f"  {hit['file']}:{hit['line']} — {hit['text']}" for hit in sample
+            )
+            if len(lazy_hits) > len(sample):
+                formatted += f"\n  ...and {len(lazy_hits) - len(sample)} more"
+            target_desc = (
+                f"'{symbol_name}'" if symbol_name else f"'{source_path.stem}'"
+            )
+            raise ValueError(
+                f"{operation} cannot safely rewrite {target_desc} — "
+                f"{len(lazy_hits)} in-function (lazy) import(s) would be hoisted "
+                f"to module top by Rope, breaking any circular-import workarounds:\n"
+                f"{formatted}\n"
+                f"Move these lazy imports to module top (resolving the circular "
+                f"dependencies they were working around), then retry."
+            )
 
     def _external_submodule_exists(self, module_name: str, submodule_name: str) -> bool:
         """Check whether an external package exposes a submodule."""
@@ -779,10 +1144,13 @@ class PythonBackend:
         project_root: str,
         dry_run: bool,
         overwrite: bool = False,
+        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Move a Python module and update all imports."""
-        root = Path(project_root).resolve()
-        project = self._get_project(project_root)
+        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        source_path = self._validate_source_path(source, str(root))
+        self._check_rope_hazards(source_path, root, "move_module")
+        project = self._get_project(str(root))
         applied_count = 0
         try:
             move_changes, rename_changes, created_init_paths, preview_parts, applied_count = self._move_module_changes(
@@ -793,8 +1161,6 @@ class PythonBackend:
                 overwrite,
                 not dry_run,
             )
-            source_path = self._validate_path(source, project_root)
-            target_path = self._validate_path(target, project_root)
             affected_files = self._merge_paths(
                 self._collect_changed_python_files(move_changes, rename_changes),
                 [source, target],
@@ -813,10 +1179,10 @@ class PythonBackend:
                 return result
 
             if rename_changes is None:
-                project.do(move_changes)
+                self._do(project, root, move_changes)
                 applied_count += 1
             if rename_changes is not None:
-                project.do(rename_changes)
+                self._do(project, root, rename_changes)
                 applied_count += 1
             return result
         except Exception:
@@ -835,11 +1201,13 @@ class PythonBackend:
         target_file: str,
         project_root: str,
         dry_run: bool,
+        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Move a symbol (function/class/variable) to another module."""
         validate_identifier(symbol_name, "python")
-        source_path = self._validate_path(source_file, project_root)
-        target_path = self._validate_path(target_file, project_root)
+        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        source_path = self._validate_source_path(source_file, str(root))
+        target_path = self._validate_path(target_file, str(root))
         target_exists = target_path.exists()
         self._validate_module_path(target_file)
         if source_path == target_path:
@@ -851,12 +1219,19 @@ class PythonBackend:
                 f"preview; create '{target_file}' first or rerun without dry_run"
             )
 
-        project = self._get_project(project_root)
+        self._check_rope_hazards(
+            source_path,
+            root,
+            "move_symbol",
+            symbol_name=symbol_name,
+        )
+
+        project = self._get_project(str(root))
         applied_count = 0
         try:
             target_resource, created_init_paths, preview_parts, applied_count = self._stage_file_resource(
                 project,
-                Path(project_root).resolve(),
+                root,
                 target_path,
                 not dry_run,
             )
@@ -883,7 +1258,7 @@ class PythonBackend:
                 result["preview"] = self._preview_text(*preview_parts, changes.get_description())
                 return result
 
-            project.do(changes)
+            self._do(project, root, changes)
             applied_count += 1
             return result
         except Exception:
@@ -904,13 +1279,15 @@ class PythonBackend:
         dry_run: bool,
         line: int | None = None,
         column: int | None = None,
+        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Rename a symbol across the codebase."""
         validate_identifier(new_name, "python")
         line, column = validate_position_selector(line, column)
-        file_path = self._validate_path(file, project_root)
+        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        file_path = self._validate_source_path(file, str(root))
 
-        project = self._get_project(project_root)
+        project = self._get_project(str(root))
         try:
             resource = self._resource_for_existing_path(project, file_path)
             source_code = resource.read()
@@ -939,7 +1316,7 @@ class PythonBackend:
                 result["preview"] = changes.get_description()
                 return result
 
-            project.do(changes)
+            self._do(project, root, changes)
             return result
         finally:
             project.close()
@@ -949,10 +1326,12 @@ class PythonBackend:
         file: str,
         project_root: str,
         dry_run: bool,
+        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Organize imports in a Python module using Rope."""
-        file_path = self._validate_path(file, project_root)
-        project = self._get_project(project_root)
+        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        file_path = self._validate_source_path(file, str(root))
+        project = self._get_project(str(root))
         try:
             resource = self._resource_for_existing_path(project, file_path)
             organizer = ImportOrganizer(project)
@@ -966,7 +1345,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            project.do(changes)
+            self._do(project, root, changes)
             return result
         finally:
             project.close()
@@ -982,11 +1361,13 @@ class PythonBackend:
         end_column: int,
         project_root: str,
         dry_run: bool,
+        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Extract a selected expression into a variable using Rope."""
         validate_identifier(new_name, "python")
-        file_path = self._validate_path(file, project_root)
-        project = self._get_project(project_root)
+        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        file_path = self._validate_source_path(file, str(root))
+        project = self._get_project(str(root))
         try:
             resource = self._resource_for_existing_path(project, file_path)
             source = resource.read()
@@ -1009,7 +1390,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            project.do(changes)
+            self._do(project, root, changes)
             return result
         finally:
             project.close()
@@ -1025,11 +1406,13 @@ class PythonBackend:
         end_column: int,
         project_root: str,
         dry_run: bool,
+        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Extract selected statements into a function using Rope."""
         validate_identifier(new_name, "python")
-        file_path = self._validate_path(file, project_root)
-        project = self._get_project(project_root)
+        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        file_path = self._validate_source_path(file, str(root))
+        project = self._get_project(str(root))
         try:
             resource = self._resource_for_existing_path(project, file_path)
             source = resource.read()
@@ -1052,7 +1435,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            project.do(changes)
+            self._do(project, root, changes)
             return result
         finally:
             project.close()
@@ -1065,6 +1448,7 @@ class PythonBackend:
         column: int,
         project_root: str,
         dry_run: bool,
+        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Inline a selected local variable, parameter, or function using Rope.
 
@@ -1077,8 +1461,9 @@ class PythonBackend:
         line, column = validate_position_selector(line, column)
         if line is None or column is None:
             raise ValueError("inline_symbol requires line and column")
-        file_path = self._validate_path(file, project_root)
-        project = self._get_project(project_root)
+        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        file_path = self._validate_source_path(file, str(root))
+        project = self._get_project(str(root))
         resource = None
         original_source = None
         did_wrap = False
@@ -1117,7 +1502,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            project.do(changes)
+            self._do(project, root, changes)
             applied = True
             return result
         finally:
@@ -1197,9 +1582,7 @@ class PythonBackend:
         if not root.exists():
             return [{"error": f"Project root does not exist: {project_root}", "type": "invalid_root"}]
 
-        for py_file in root.rglob("*.py"):
-            if "__pycache__" in str(py_file) or ".venv" in str(py_file) or ".ropeproject" in str(py_file):
-                continue
+        for py_file in self._project_python_files_for_scan(root):
             try:
                 source = py_file.read_text()
                 tree = ast.parse(source)

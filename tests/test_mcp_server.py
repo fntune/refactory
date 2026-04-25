@@ -53,6 +53,7 @@ class TestToolListing:
         assert "source" in props
         assert "target" in props
         assert "project_root" in props
+        assert "expected_git_root" in props
         assert "dry_run" in props
         assert "overwrite" in props
 

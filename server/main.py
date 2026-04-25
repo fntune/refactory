@@ -76,6 +76,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Root directory of the project (defaults to cwd)",
                     },
+                    "expected_git_root": {
+                        "type": "string",
+                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                    },
                     "dry_run": {
                         "type": "boolean",
                         "description": "Preview changes without applying them",
@@ -112,6 +116,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Root directory of the project (defaults to cwd)",
                     },
+                    "expected_git_root": {
+                        "type": "string",
+                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                    },
                     "dry_run": {
                         "type": "boolean",
                         "description": "Preview changes without applying them",
@@ -142,6 +150,10 @@ async def list_tools() -> list[Tool]:
                     "project_root": {
                         "type": "string",
                         "description": "Root directory of the project (defaults to cwd)",
+                    },
+                    "expected_git_root": {
+                        "type": "string",
+                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
                     },
                     "dry_run": {
                         "type": "boolean",
@@ -192,6 +204,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Root directory of the project (defaults to cwd)",
                     },
+                    "expected_git_root": {
+                        "type": "string",
+                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                    },
                     "dry_run": {
                         "type": "boolean",
                         "description": "Preview changes without applying them",
@@ -219,6 +235,10 @@ async def list_tools() -> list[Tool]:
                     "project_root": {
                         "type": "string",
                         "description": "Root directory of the project (defaults to cwd)",
+                    },
+                    "expected_git_root": {
+                        "type": "string",
+                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
                     },
                     "dry_run": {
                         "type": "boolean",
@@ -255,6 +275,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Root directory of the project (defaults to cwd)",
                     },
+                    "expected_git_root": {
+                        "type": "string",
+                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                    },
                     "dry_run": {
                         "type": "boolean",
                         "description": "Preview changes without applying them",
@@ -284,6 +308,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Root directory of the project (defaults to cwd)",
                     },
+                    "expected_git_root": {
+                        "type": "string",
+                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                    },
                     "dry_run": {
                         "type": "boolean",
                         "description": "Preview changes without applying them",
@@ -302,6 +330,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         project_root = arguments.get("project_root", ".")
         dry_run = arguments.get("dry_run", False)
+        expected_git_root = arguments.get("expected_git_root")
 
         if name == "move_module":
             source = arguments["source"]
@@ -309,7 +338,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             overwrite = arguments.get("overwrite", False)
             language = detect_language(source)
             backend = get_backend(language)
-            result = backend.move_module(source, target, project_root, dry_run, overwrite=overwrite)
+            result = backend.move_module(
+                source,
+                target,
+                project_root,
+                dry_run,
+                overwrite=overwrite,
+                expected_git_root=expected_git_root,
+            )
 
         elif name == "move_symbol":
             source_file = arguments["source_file"]
@@ -317,7 +353,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             target_file = arguments["target_file"]
             language = detect_language(source_file)
             backend = get_backend(language)
-            result = backend.move_symbol(source_file, symbol_name, target_file, project_root, dry_run)
+            result = backend.move_symbol(
+                source_file,
+                symbol_name,
+                target_file,
+                project_root,
+                dry_run,
+                expected_git_root=expected_git_root,
+            )
 
         elif name == "rename_symbol":
             file = arguments["file"]
@@ -337,6 +380,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 dry_run,
                 line=line,
                 column=column,
+                expected_git_root=expected_git_root,
             )
 
         elif name == "validate_imports":
@@ -356,6 +400,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 arguments["file"],
                 project_root,
                 dry_run,
+                expected_git_root=expected_git_root,
             )
 
         elif name == "extract_variable":
@@ -369,6 +414,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 end_column=arguments["end_column"],
                 project_root=project_root,
                 dry_run=dry_run,
+                expected_git_root=expected_git_root,
             )
 
         elif name == "extract_function":
@@ -382,6 +428,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 end_column=arguments["end_column"],
                 project_root=project_root,
                 dry_run=dry_run,
+                expected_git_root=expected_git_root,
             )
 
         elif name == "inline_symbol":
@@ -392,6 +439,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 column=arguments["column"],
                 project_root=project_root,
                 dry_run=dry_run,
+                expected_git_root=expected_git_root,
             )
 
         else:

@@ -1,5 +1,47 @@
 """Hermetic tests for Python refactoring backend (Rope)."""
+import shutil
+import subprocess
+
 import pytest
+
+
+def _git(cwd, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _make_git_repo_with_backend(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "refactory@example.test")
+    _git(repo, "config", "user.name", "Refactory Test")
+
+    backend = repo / "backend"
+    package = backend / "pkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "db.py").write_text(
+        "class Database:\n"
+        "    def connect(self):\n"
+        "        return True\n"
+    )
+    (package / "main.py").write_text(
+        "from pkg.db import Database\n\n"
+        "def run():\n"
+        "    return Database().connect()\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "initial")
+
+    worker = tmp_path / "worker"
+    _git(repo, "worktree", "add", "-q", "-b", "worker-branch", str(worker))
+    return repo, worker
 
 
 class TestMoveModule:
@@ -622,11 +664,36 @@ class TestEdgeCases:
     """Tests for edge cases and error handling."""
 
     def test_move_nonexistent_file_raises(self, python_backend, temp_python_project):
-        """Moving nonexistent file should raise error."""
-        with pytest.raises(Exception):
+        """Moving nonexistent file should raise a refactory-shaped error."""
+        with pytest.raises(ValueError, match="source file not found"):
             python_backend.move_module(
                 source="src/nonexistent.py",
                 target="src/somewhere/nonexistent.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+            )
+
+    def test_move_symbol_nonexistent_source_raises(
+        self, python_backend, temp_python_project
+    ):
+        """Moving a symbol from a nonexistent source file should fail closed."""
+        (temp_python_project / "src" / "target.py").write_text("")
+        with pytest.raises(ValueError, match="source file not found"):
+            python_backend.move_symbol(
+                source_file="src/nonexistent.py",
+                symbol_name="foo",
+                target_file="src/target.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+            )
+
+    def test_rename_nonexistent_file_raises(self, python_backend, temp_python_project):
+        """Renaming in a nonexistent file should raise a refactory-shaped error."""
+        with pytest.raises(ValueError, match="source file not found"):
+            python_backend.rename_symbol(
+                file="src/nonexistent.py",
+                old_name="foo",
+                new_name="bar",
                 project_root=str(temp_python_project),
                 dry_run=False,
             )
@@ -727,3 +794,471 @@ class TestEdgeCases:
         errors = python_backend.validate_imports(str(tmp_path / "nonexistent"))
         assert len(errors) == 1
         assert errors[0]["type"] == "invalid_root"
+
+
+class TestRopeHazardDetectors:
+    """Fail-closed pre-flights for Rope limitations that silently corrupt code."""
+
+    def test_move_module_fails_on_basename_collision(self, python_backend, tmp_path):
+        """E2: source file exporting a top-level binding named same as stem.
+
+        Rope confuses variable attribute access (``foo.method()``) with module
+        attribute access when rewriting consumers, corrupting call sites.
+        """
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "project_service.py").write_text(
+            "class ProjectService:\n"
+            "    def do_thing(self):\n"
+            "        return 1\n\n"
+            "project_service = ProjectService()\n"
+        )
+        (project / "consumer.py").write_text(
+            "from project_service import project_service\n\n"
+            "def use():\n"
+            "    return project_service.do_thing()\n"
+        )
+
+        before = (project / "consumer.py").read_text()
+        with pytest.raises(ValueError, match="same name as the module"):
+            python_backend.move_module(
+                source="project_service.py",
+                target="store/project_service.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        assert (project / "consumer.py").read_text() == before
+        assert (project / "project_service.py").exists()
+        assert not (project / "store").exists()
+
+    def test_move_module_fails_on_lazy_import(self, python_backend, tmp_path):
+        """E1: consumer uses in-function import of source module.
+
+        Rope hoists in-function imports to module top, breaking any
+        circular-import workarounds the lazy import was working around.
+        """
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "worker.py").write_text("VALUE = 1\n")
+        (project / "consumer.py").write_text(
+            "def run():\n"
+            "    import worker\n"
+            "    return worker.VALUE\n"
+        )
+
+        before_consumer = (project / "consumer.py").read_text()
+        with pytest.raises(ValueError, match="lazy"):
+            python_backend.move_module(
+                source="worker.py",
+                target="bg/worker.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        assert (project / "consumer.py").read_text() == before_consumer
+        assert (project / "worker.py").exists()
+        assert not (project / "bg").exists()
+
+    def test_move_module_reports_lazy_import_location(self, python_backend, tmp_path):
+        """Lazy-import error should name each offending file and line."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "service.py").write_text("HELLO = 'hi'\n")
+        (project / "a.py").write_text(
+            "def run():\n"
+            "    from service import HELLO\n"
+            "    return HELLO\n"
+        )
+        (project / "b.py").write_text(
+            "class App:\n"
+            "    def boot(self):\n"
+            "        import service\n"
+            "        return service.HELLO\n"
+        )
+
+        with pytest.raises(ValueError) as info:
+            python_backend.move_module(
+                source="service.py",
+                target="services/service.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        message = str(info.value)
+        assert "a.py:2" in message
+        assert "b.py:3" in message
+        assert "2 in-function" in message
+
+    def test_move_module_ignores_lazy_imports_of_other_modules(
+        self, python_backend, tmp_path
+    ):
+        """Lazy imports of unrelated modules should not block the move."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "target_mod.py").write_text("VALUE = 1\n")
+        (project / "other_mod.py").write_text("OTHER = 2\n")
+        (project / "consumer.py").write_text(
+            "from target_mod import VALUE\n\n"
+            "def run():\n"
+            "    import other_mod\n"
+            "    return other_mod.OTHER + VALUE\n"
+        )
+
+        result = python_backend.move_module(
+            source="target_mod.py",
+            target="pkg/target_mod.py",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        assert (project / "pkg" / "target_mod.py").exists()
+
+    def test_move_symbol_fails_on_basename_collision(self, python_backend, tmp_path):
+        """E2 applies to move_symbol too."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "project_service.py").write_text(
+            "class ProjectService:\n"
+            "    def do(self): return 1\n\n"
+            "project_service = ProjectService()\n\n"
+            "def helper():\n"
+            "    return 42\n"
+        )
+        (project / "store.py").write_text("")
+
+        with pytest.raises(ValueError, match="same name as the module"):
+            python_backend.move_symbol(
+                source_file="project_service.py",
+                symbol_name="helper",
+                target_file="store.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        assert "def helper" in (project / "project_service.py").read_text()
+
+    def test_move_symbol_fails_on_lazy_import(self, python_backend, tmp_path):
+        """E1 applies to move_symbol too."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "worker.py").write_text(
+            "def do_work():\n"
+            "    return 1\n"
+        )
+        (project / "target.py").write_text("")
+        (project / "consumer.py").write_text(
+            "def run():\n"
+            "    from worker import do_work\n"
+            "    return do_work()\n"
+        )
+
+        with pytest.raises(ValueError, match="lazy"):
+            python_backend.move_symbol(
+                source_file="worker.py",
+                symbol_name="do_work",
+                target_file="target.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        assert "def do_work" in (project / "worker.py").read_text()
+        assert (project / "target.py").read_text() == ""
+
+    def test_move_symbol_ignores_lazy_imports_of_other_symbols(
+        self, python_backend, tmp_path
+    ):
+        """E1 for move_symbol should narrow to the specific symbol being moved.
+
+        A lazy ``from worker import OTHER_SYMBOL`` does not trip Rope's
+        move_symbol rewrite of ``do_work`` — other names stay pointed at the
+        original module. Flagging it as a hazard would be over-conservative.
+        """
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "worker.py").write_text(
+            "def do_work():\n"
+            "    return 1\n\n"
+            "OTHER_SYMBOL = 'unrelated'\n"
+        )
+        (project / "target.py").write_text("")
+        (project / "consumer.py").write_text(
+            "def run():\n"
+            "    from worker import OTHER_SYMBOL\n"
+            "    return OTHER_SYMBOL\n"
+        )
+
+        result = python_backend.move_symbol(
+            source_file="worker.py",
+            symbol_name="do_work",
+            target_file="target.py",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        assert "def do_work" in (project / "target.py").read_text()
+        # Consumer's lazy import of the unrelated symbol should be untouched.
+        assert "from worker import OTHER_SYMBOL" in (project / "consumer.py").read_text()
+
+    def test_hazard_check_runs_in_dry_run_too(self, python_backend, tmp_path):
+        """Dry-run must still fail-closed on hazards; otherwise a preview
+        misleads the user about what the real run would do."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "project_service.py").write_text("project_service = object()\n")
+
+        with pytest.raises(ValueError, match="same name as the module"):
+            python_backend.move_module(
+                source="project_service.py",
+                target="store/project_service.py",
+                project_root=str(project),
+                dry_run=True,
+            )
+
+        assert (project / "project_service.py").exists()
+        assert not (project / "store").exists()
+
+    def test_top_level_import_of_source_does_not_trip_lazy_detector(
+        self, python_backend, tmp_path
+    ):
+        """E1 only catches in-function imports. Top-level imports rewrite cleanly."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "worker.py").write_text("VALUE = 1\n")
+        (project / "consumer.py").write_text(
+            "import worker\n\n"
+            "def run():\n"
+            "    return worker.VALUE\n"
+        )
+
+        result = python_backend.move_module(
+            source="worker.py",
+            target="bg/worker.py",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        assert (project / "bg" / "worker.py").exists()
+
+
+class TestWorktreeIsolation:
+    """Guards against applying Rope changes to the wrong git worktree."""
+
+    def test_expected_git_root_blocks_wrong_worktree(
+        self, python_backend, tmp_path
+    ):
+        """A worker-root guard should catch accidental main-checkout roots."""
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+
+        main_repo, worker = _make_git_repo_with_backend(tmp_path)
+
+        with pytest.raises(ValueError, match="not expected_git_root"):
+            python_backend.move_module(
+                source="pkg/db.py",
+                target="pkg/storage/db.py",
+                project_root=str(main_repo / "backend"),
+                dry_run=False,
+                expected_git_root=str(worker),
+            )
+
+        assert (main_repo / "backend" / "pkg" / "db.py").exists()
+        assert not (main_repo / "backend" / "pkg" / "storage").exists()
+        assert _git(main_repo, "status", "--short").stdout == ""
+
+    def test_linked_worktree_move_mutates_only_worker(
+        self, python_backend, tmp_path
+    ):
+        """A move in a linked worktree must leave the main checkout untouched."""
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+
+        main_repo, worker = _make_git_repo_with_backend(tmp_path)
+
+        result = python_backend.move_module(
+            source="pkg/db.py",
+            target="pkg/storage/db.py",
+            project_root=str(worker / "backend"),
+            dry_run=False,
+            expected_git_root=str(worker),
+        )
+
+        assert result["success"]
+        assert (worker / "backend" / "pkg" / "storage" / "db.py").exists()
+        assert "from pkg.storage.db import Database" in (
+            worker / "backend" / "pkg" / "main.py"
+        ).read_text()
+        assert (main_repo / "backend" / "pkg" / "db.py").exists()
+        assert not (main_repo / "backend" / "pkg" / "storage").exists()
+        assert _git(main_repo, "status", "--short").stdout == ""
+
+    def test_refuses_changed_resources_outside_project_root(
+        self, python_backend, tmp_path
+    ):
+        """The apply guard checks Rope's changed resources before project.do."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+
+        class FakeProject:
+            address = str(project_root)
+
+        class FakeResource:
+            path = "../outside.py"
+
+        class FakeChange:
+            def get_changed_resources(self):
+                return [FakeResource()]
+
+        with pytest.raises(ValueError, match="outside project_root"):
+            python_backend._assert_change_inside_project_root(
+                FakeProject(),
+                project_root,
+                FakeChange(),
+            )
+
+
+class TestValidateImportsScope:
+    """Scope tests for validate_imports — should ignore vendored/build/worktree code."""
+
+    def test_ignores_build_dir_in_nongit_mode(self, python_backend, tmp_path):
+        """Files inside build/ should not appear in validate_imports output."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "good.py").write_text("VALUE = 1\n")
+        build_dir = project / "build"
+        build_dir.mkdir()
+        (build_dir / "broken.py").write_text("from nowhere import missing\n")
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert not any("build/broken.py" in error.get("file", "") for error in errors)
+
+    def test_ignores_standard_venv_directories(self, python_backend, tmp_path):
+        """Every well-known virtualenv name should be skipped in non-git mode."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "good.py").write_text("VALUE = 1\n")
+        for venv_name in [".venv", "venv", "env", ".tox", ".mypy_cache", "node_modules"]:
+            venv = project / venv_name
+            venv.mkdir()
+            (venv / "broken.py").write_text("from nonexistent import missing\n")
+
+        errors = python_backend.validate_imports(str(project))
+
+        files = [error.get("file", "") for error in errors]
+        assert not any("/broken.py" in entry for entry in files)
+
+    def test_ignores_egg_info_directories(self, python_backend, tmp_path):
+        """*.egg-info directories hold build artifacts and should be skipped."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "good.py").write_text("VALUE = 1\n")
+        egg_info = project / "mypkg.egg-info"
+        egg_info.mkdir()
+        (egg_info / "broken.py").write_text("from nonexistent import missing\n")
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert not any("egg-info" in error.get("file", "") for error in errors)
+
+    def test_respects_gitignore(self, python_backend, tmp_path):
+        """In a git repo, files matched by .gitignore should not be scanned."""
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+
+        project = tmp_path / "project"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+        (project / ".gitignore").write_text("junk/\ngenerated.py\n")
+        (project / "tracked.py").write_text("VALUE = 1\n")
+        (project / "generated.py").write_text("from nonexistent import missing\n")
+        junk = project / "junk"
+        junk.mkdir()
+        (junk / "broken.py").write_text("from nonexistent import missing\n")
+
+        errors = python_backend.validate_imports(str(project))
+
+        files = [error.get("file", "") for error in errors]
+        assert "generated.py" not in files
+        assert not any("junk/" in entry for entry in files)
+
+    def test_respects_gitignore_when_project_root_is_subdir(
+        self, python_backend, tmp_path
+    ):
+        """A package sub-root inside a git worktree should still honor .gitignore."""
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+
+        repo = tmp_path / "repo"
+        backend = repo / "backend"
+        backend.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / ".gitignore").write_text("backend/generated.py\nbackend/junk/\n")
+        (backend / "tracked.py").write_text("VALUE = 1\n")
+        (backend / "generated.py").write_text("from missing_generated import value\n")
+        junk = backend / "junk"
+        junk.mkdir()
+        (junk / "broken.py").write_text("from missing_junk import value\n")
+
+        errors = python_backend.validate_imports(str(backend))
+
+        assert errors == []
+
+    def test_ignores_git_worktree_directory(self, python_backend, tmp_path):
+        """Files under .git/worktrees/ must never surface in validate_imports."""
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+
+        project = tmp_path / "project"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+        (project / "tracked.py").write_text("VALUE = 1\n")
+
+        worktree_branch = project / ".git" / "worktrees" / "branch"
+        worktree_branch.mkdir(parents=True)
+        (worktree_branch / "broken.py").write_text(
+            "from definitely_nonexistent import missing\n"
+        )
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert not any(".git/worktrees" in error.get("file", "") for error in errors)
+
+    def test_gitignored_file_with_broken_import_does_not_error(
+        self, python_backend, tmp_path
+    ):
+        """Validate end-to-end: a gitignored directory full of garbage imports
+        should not produce a single error entry."""
+        if not shutil.which("git"):
+            pytest.skip("git not available")
+
+        project = tmp_path / "project"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+        (project / ".gitignore").write_text("vendored/\n")
+        vendored = project / "vendored"
+        vendored.mkdir()
+        for i in range(5):
+            (vendored / f"broken_{i}.py").write_text(
+                f"from nonexistent_{i} import x\n"
+            )
+        (project / "good.py").write_text("VALUE = 1\n")
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert not any("vendored" in error.get("file", "") for error in errors)
+
+    def test_falls_back_to_rglob_when_not_a_git_repo(self, python_backend, tmp_path):
+        """Without .git present, the scan should still find real import errors."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "consumer.py").write_text(
+            "from nonexistent_module import missing\n"
+        )
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert any("consumer.py" in error.get("file", "") for error in errors)

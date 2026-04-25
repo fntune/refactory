@@ -756,3 +756,82 @@ export function Component() {
         # Should no longer have helperFunc import from utils
         utils_imports = [line for line in main_content.split("\n") if "utils" in line and "helperFunc" in line]
         assert len(utils_imports) == 0
+
+
+class TestDependencyProbe:
+    """The backend should surface an actionable error when ts-morph is missing."""
+
+    def test_backend_reports_missing_ts_morph(self, tmp_path, monkeypatch):
+        """Simulate missing ts-morph by pointing the marker at a nonexistent path."""
+        from backends import typescript as ts_module
+
+        monkeypatch.setattr(
+            ts_module,
+            "TSMORPH_MODULE_MARKER",
+            tmp_path / "never_exists" / "ts-morph" / "package.json",
+        )
+
+        backend = ts_module.TypeScriptBackend()
+        with pytest.raises(RuntimeError) as info:
+            backend.move_module(
+                source="src/a.ts",
+                target="src/b.ts",
+                project_root=str(tmp_path),
+                dry_run=True,
+            )
+
+        message = str(info.value)
+        assert "ts-morph is not installed" in message
+        assert "pnpm install" in message
+
+    def test_backend_reports_missing_script(self, tmp_path, monkeypatch):
+        """Missing refactor.js should give a clean, actionable error too."""
+        from backends import typescript as ts_module
+
+        monkeypatch.setattr(
+            ts_module,
+            "TSMORPH_SCRIPT",
+            tmp_path / "never_exists" / "refactor.js",
+        )
+
+        backend = ts_module.TypeScriptBackend()
+        with pytest.raises(RuntimeError, match="ts-morph script not found"):
+            backend.move_module(
+                source="src/a.ts",
+                target="src/b.ts",
+                project_root=str(tmp_path),
+                dry_run=True,
+            )
+
+    def test_probe_runs_only_once_per_instance(self, tmp_path, monkeypatch):
+        """The dependency check should be cached on the instance, not re-stat per call."""
+        from backends import typescript as ts_module
+
+        monkeypatch.setattr(
+            ts_module,
+            "TSMORPH_MODULE_MARKER",
+            tmp_path / "never_exists" / "ts-morph" / "package.json",
+        )
+
+        backend = ts_module.TypeScriptBackend()
+        call_count = {"n": 0}
+        original = ts_module.TypeScriptBackend._check_dependencies
+
+        def counting_check() -> str | None:
+            call_count["n"] += 1
+            return original()
+
+        monkeypatch.setattr(
+            ts_module.TypeScriptBackend, "_check_dependencies", staticmethod(counting_check)
+        )
+
+        for _ in range(3):
+            with pytest.raises(RuntimeError):
+                backend.move_module(
+                    source="src/a.ts",
+                    target="src/b.ts",
+                    project_root=str(tmp_path),
+                    dry_run=True,
+                )
+
+        assert call_count["n"] == 0  # cached result reused; probe not re-invoked
