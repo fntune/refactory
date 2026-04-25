@@ -331,12 +331,12 @@ class TestPythonOnlyMcpExecution:
         result = await call_tool("organize_imports", {
             "file": "mod.py",
             "project_root": str(project),
-            "dry_run": True,
         })
 
         data = json.loads(result[0].text)
         assert data["success"]
-        assert data["dry_run"]
+        assert data["apply"] is False
+        assert "apply: true" in data["message"]
         assert "preview" in data
 
     @pytest.mark.asyncio
@@ -361,12 +361,12 @@ class TestPythonOnlyMcpExecution:
             "end_line": 2,
             "end_column": 18,
             "project_root": str(project),
-            "dry_run": True,
         })
 
         data = json.loads(result[0].text)
         assert data["success"]
-        assert data["dry_run"]
+        assert data["apply"] is False
+        assert "apply: true" in data["message"]
         assert data["preview"]
         assert mod.read_text() == original
 
@@ -392,12 +392,12 @@ class TestPythonOnlyMcpExecution:
             "end_line": 2,
             "end_column": 18,
             "project_root": str(project),
-            "dry_run": True,
         })
 
         data = json.loads(result[0].text)
         assert data["success"]
-        assert data["dry_run"]
+        assert data["apply"] is False
+        assert "apply: true" in data["message"]
         assert data["preview"]
         assert mod.read_text() == original
 
@@ -420,11 +420,11 @@ class TestPythonOnlyMcpExecution:
             "line": 4,
             "column": 12,
             "project_root": str(project),
-            "dry_run": True,
         })
 
         data = json.loads(result[0].text)
         assert data["success"]
-        assert data["dry_run"]
+        assert data["apply"] is False
+        assert "apply: true" in data["message"]
         assert data["preview"]
         assert mod.read_text() == original

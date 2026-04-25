@@ -86,11 +86,13 @@ class TestMcpE2E:
             "inline_symbol",
         }
         assert "overwrite" in tools["move_module"].inputSchema["properties"]
+        assert "apply" in tools["move_module"].inputSchema["properties"]
+        assert "dry_run" not in tools["move_module"].inputSchema["properties"]
         assert "line" in tools["rename_symbol"].inputSchema["properties"]
         assert "column" in tools["rename_symbol"].inputSchema["properties"]
 
-    async def test_python_move_module_dry_run_over_stdio(self, temp_python_project):
-        """Dry-run module moves should round-trip through MCP without mutating files."""
+    async def test_python_move_module_preview_over_stdio(self, temp_python_project):
+        """Default preview module moves should round-trip without mutating files."""
         before = snapshot_tree(temp_python_project)
 
         async with open_mcp_session() as session:
@@ -98,11 +100,12 @@ class TestMcpE2E:
                 "source": "src/db.py",
                 "target": "src/storage/db.py",
                 "project_root": str(temp_python_project),
-                "dry_run": True,
             })
 
         assert data["success"]
-        assert data["dry_run"]
+        assert data["apply"] is False
+        assert "apply: true" in data["message"]
+        assert "dry_run" not in data
         assert "src/db.py" in data["affected_files"]
         assert "src/main.py" in data["affected_files"]
         assert "preview" in data
@@ -125,6 +128,7 @@ class TestMcpE2E:
                 "old_name": "name",
                 "new_name": "person",
                 "project_root": str(project),
+                "apply": True,
                 "line": 1,
                 "column": 11,
             })
@@ -156,12 +160,14 @@ class TestMcpE2E:
                 "source": "src/utils.py",
                 "target": "src/core/utils.py",
                 "project_root": str(project),
+                "apply": True,
             })
             rename_data = await call_json(session, "rename_symbol", {
                 "file": "src/core/utils.py",
                 "old_name": "name",
                 "new_name": "person",
                 "project_root": str(project),
+                "apply": True,
                 "line": 1,
                 "column": 17,
             })
@@ -188,6 +194,7 @@ class TestMcpE2E:
                 "source": "src/utils.ts",
                 "target": "src/core/utils.ts",
                 "project_root": str(temp_typescript_nodenext_project),
+                "apply": True,
             })
 
         assert data["success"]
@@ -218,12 +225,14 @@ class TestMcpE2E:
                 "source": "src/utils.ts",
                 "target": "src/core/utils.ts",
                 "project_root": str(project),
+                "apply": True,
             })
             rename_data = await call_json(session, "rename_symbol", {
                 "file": "src/core/utils.ts",
                 "old_name": "helperFunc",
                 "new_name": "assistFunc",
                 "project_root": str(project),
+                "apply": True,
             })
             validate_data = await call_json(session, "validate_imports", {
                 "project_root": str(project),

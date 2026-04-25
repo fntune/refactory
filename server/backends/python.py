@@ -1216,7 +1216,7 @@ class PythonBackend:
         if dry_run and not target_exists:
             raise ValueError(
                 f"move_symbol dry-run requires the target module to exist for an exact "
-                f"preview; create '{target_file}' first or rerun without dry_run"
+                f"preview; create '{target_file}' first or call the MCP tool with apply: true"
             )
 
         self._check_rope_hazards(
@@ -1479,7 +1479,7 @@ class PythonBackend:
             if did_wrap and dry_run:
                 raise ValueError(
                     "inline_symbol dry-run cannot compute an exact preview when "
-                    "operator-precedence wrapping is required; rerun without dry_run"
+                    "operator-precedence wrapping is required; call the MCP tool with apply: true"
                 )
             if did_wrap:
                 resource.write(modified_source)

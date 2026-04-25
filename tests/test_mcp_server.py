@@ -54,7 +54,8 @@ class TestToolListing:
         assert "target" in props
         assert "project_root" in props
         assert "expected_git_root" in props
-        assert "dry_run" in props
+        assert "apply" in props
+        assert "dry_run" not in props
         assert "overwrite" in props
 
         required = move_module.inputSchema["required"]
@@ -86,13 +87,14 @@ class TestToolExecution:
             "source": "src/db.py",
             "target": "src/storage/db.py",
             "project_root": str(temp_python_project),
-            "dry_run": True,
         })
 
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["success"]
-        assert data["dry_run"]
+        assert data["apply"] is False
+        assert "apply: true" in data["message"]
+        assert "dry_run" not in data
 
     @pytest.mark.asyncio
     async def test_rename_symbol_execution(self, temp_python_project):
@@ -104,12 +106,12 @@ class TestToolExecution:
             "old_name": "helper_func",
             "new_name": "assist_func",
             "project_root": str(temp_python_project),
-            "dry_run": True,
         })
 
         assert len(result) == 1
         data = json.loads(result[0].text)
         assert data["success"]
+        assert data["apply"] is False
 
     @pytest.mark.asyncio
     async def test_rename_parameter_execution_with_selector(self, tmp_path):
@@ -130,13 +132,14 @@ class TestToolExecution:
             "old_name": "name",
             "new_name": "person",
             "project_root": str(project),
-            "dry_run": False,
+            "apply": True,
             "line": 1,
             "column": 11,
         })
 
         data = json.loads(result[0].text)
         assert data["success"]
+        assert data["apply"] is True
         content = (project / "params.py").read_text()
         assert "def greet(person):" in content
         assert "def other(name):" in content
@@ -263,34 +266,32 @@ class TestErrorHandling:
         assert len(result) == 1
 
 
-class TestDryRunMode:
-    """Tests for dry run functionality."""
+class TestApplyMode:
+    """Tests for preview/apply MCP semantics."""
 
     @pytest.mark.asyncio
-    async def test_dry_run_default_false(self, temp_python_project):
-        """dry_run should default to False."""
+    async def test_apply_defaults_to_preview(self, temp_python_project):
+        """Omitting apply should preview without mutating files."""
         from main import call_tool
 
-        # Don't pass dry_run, it should default to False
-        # But we can't easily test the default without actually modifying files
-        # So we explicitly test with dry_run=True
         result = await call_tool("move_module", {
             "source": "src/db.py",
             "target": "src/storage/db.py",
             "project_root": str(temp_python_project),
-            "dry_run": True,
         })
 
         data = json.loads(result[0].text)
-        assert data["dry_run"]
+        assert data["apply"] is False
+        assert "apply: true" in data["message"]
+        assert "preview" in data
 
         # File should not have moved
         assert (temp_python_project / "src" / "db.py").exists()
         assert not (temp_python_project / "src" / "storage").exists()
 
     @pytest.mark.asyncio
-    async def test_dry_run_reports_changes(self, temp_python_project):
-        """Dry run should report what would change."""
+    async def test_preview_reports_changes(self, temp_python_project):
+        """Preview should report what would change."""
         from main import call_tool
 
         result = await call_tool("rename_symbol", {
@@ -298,10 +299,28 @@ class TestDryRunMode:
             "old_name": "helper_func",
             "new_name": "assist_func",
             "project_root": str(temp_python_project),
-            "dry_run": True,
         })
 
         data = json.loads(result[0].text)
+        assert data["apply"] is False
         assert "affected_files" in data
         assert len(data["affected_files"]) > 0
         assert "preview" in data
+
+    @pytest.mark.asyncio
+    async def test_apply_must_be_literal_true(self, temp_python_project):
+        """Only JSON boolean true should apply; truthy strings still preview."""
+        from main import call_tool
+
+        result = await call_tool("move_module", {
+            "source": "src/db.py",
+            "target": "src/storage/db.py",
+            "project_root": str(temp_python_project),
+            "apply": "true",
+        })
+
+        data = json.loads(result[0].text)
+        assert data["success"]
+        assert data["apply"] is False
+        assert (temp_python_project / "src" / "db.py").exists()
+        assert not (temp_python_project / "src" / "storage").exists()

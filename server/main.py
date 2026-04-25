@@ -36,6 +36,8 @@ EXTENSION_MAP = {
     ".jsx": "typescript",
 }
 
+PREVIEW_MESSAGE = "Preview only. To apply these changes, call the same tool with apply: true."
+
 
 def detect_language(file_path: str) -> str:
     """Detect language from file extension."""
@@ -52,6 +54,16 @@ def get_backend(language: str):
     if not backend_cls:
         raise ValueError(f"Unsupported language: {language}. Supported: {list(BACKENDS.keys())}")
     return backend_cls()
+
+
+def format_apply_result(result: dict[str, Any], apply_changes: bool) -> dict[str, Any]:
+    """Expose apply-mode semantics at the MCP boundary."""
+    formatted = dict(result)
+    formatted.pop("dry_run", None)
+    formatted["apply"] = apply_changes
+    if result.get("success") and not apply_changes:
+        formatted["message"] = PREVIEW_MESSAGE
+    return formatted
 
 
 @server.list_tools()
@@ -78,11 +90,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "expected_git_root": {
                         "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
                     },
-                    "dry_run": {
+                    "apply": {
                         "type": "boolean",
-                        "description": "Preview changes without applying them",
+                        "description": "Apply changes to files. Omit or false to preview only.",
                         "default": False,
                     },
                     "overwrite": {
@@ -118,11 +130,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "expected_git_root": {
                         "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
                     },
-                    "dry_run": {
+                    "apply": {
                         "type": "boolean",
-                        "description": "Preview changes without applying them",
+                        "description": "Apply changes to files. Omit or false to preview only.",
                         "default": False,
                     },
                 },
@@ -153,11 +165,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "expected_git_root": {
                         "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
                     },
-                    "dry_run": {
+                    "apply": {
                         "type": "boolean",
-                        "description": "Preview changes without applying them",
+                        "description": "Apply changes to files. Omit or false to preview only.",
                         "default": False,
                     },
                     "line": {
@@ -206,11 +218,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "expected_git_root": {
                         "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
                     },
-                    "dry_run": {
+                    "apply": {
                         "type": "boolean",
-                        "description": "Preview changes without applying them",
+                        "description": "Apply changes to files. Omit or false to preview only.",
                         "default": False,
                     },
                 },
@@ -238,11 +250,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "expected_git_root": {
                         "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
                     },
-                    "dry_run": {
+                    "apply": {
                         "type": "boolean",
-                        "description": "Preview changes without applying them",
+                        "description": "Apply changes to files. Omit or false to preview only.",
                         "default": False,
                     },
                 },
@@ -277,11 +289,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "expected_git_root": {
                         "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
                     },
-                    "dry_run": {
+                    "apply": {
                         "type": "boolean",
-                        "description": "Preview changes without applying them",
+                        "description": "Apply changes to files. Omit or false to preview only.",
                         "default": False,
                     },
                 },
@@ -310,11 +322,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "expected_git_root": {
                         "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before applying changes",
+                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
                     },
-                    "dry_run": {
+                    "apply": {
                         "type": "boolean",
-                        "description": "Preview changes without applying them",
+                        "description": "Apply changes to files. Omit or false to preview only.",
                         "default": False,
                     },
                 },
@@ -329,7 +341,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Execute a refactoring tool."""
     try:
         project_root = arguments.get("project_root", ".")
-        dry_run = arguments.get("dry_run", False)
+        apply_changes = arguments.get("apply") is True
+        dry_run = not apply_changes
         expected_git_root = arguments.get("expected_git_root")
 
         if name == "move_module":
@@ -444,6 +457,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
         else:
             raise ValueError(f"Unknown tool: {name}")
+
+        if name != "validate_imports":
+            result = format_apply_result(result, apply_changes)
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 

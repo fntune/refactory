@@ -30,7 +30,7 @@ Python-only tools:
 | `extract_function` | Extract selected Python statements into a function |
 | `inline_symbol` | Inline a selected Python local variable, parameter, or function |
 
-Every tool supports **dry-run mode** — Claude can preview the full diff before committing any code changes. Python dry-runs now use Rope's native change descriptions instead of copying the whole repo to a temporary project.
+Mutating tools preview by default. Claude must pass `apply: true` to write files. Python previews use Rope's native change descriptions instead of copying the whole repo to a temporary project.
 
 ---
 
@@ -92,29 +92,29 @@ Claude calls tools directly during a session. Typical flow:
 
 ```
 # Preview a move
-move_module("src/utils.py", "src/core/utils.py", dry_run=True)
-→ shows diff: which files change, which imports get rewritten
+move_module("src/utils.py", "src/core/utils.py")
+→ shows diff: which files change, which imports get rewritten, plus "call again with apply: true"
 
 # Apply it
-move_module("src/utils.py", "src/core/utils.py")
+move_module("src/utils.py", "src/core/utils.py", apply=True)
 → { success: true, affected_files: ["src/api.py", "tests/test_utils.py"] }
 
 # Replace an existing destination explicitly
-move_module("src/db.py", "src/storage/db.py", overwrite=True)
+move_module("src/db.py", "src/storage/db.py", overwrite=True, apply=True)
 
 # Rename an ambiguous parameter by declaration location
-rename_symbol("src/api.py", "name", "account_name", line=12, column=19)
+rename_symbol("src/api.py", "name", "account_name", line=12, column=19, apply=True)
 
 # Batch: move multiple modules in one turn (parallel tool calls)
-move_module("src/db.py", "src/storage/db.py")
-move_module("src/cache.py", "src/storage/cache.py")
-rename_symbol("src/api.py", "getData", "fetchData")
+move_module("src/db.py", "src/storage/db.py", apply=True)
+move_module("src/cache.py", "src/storage/cache.py", apply=True)
+rename_symbol("src/api.py", "getData", "fetchData", apply=True)
 
 # Verify nothing broke
 validate_imports("src/")
 ```
 
-For complex multi-step reorganizations, use the `/refactor` command to invoke the refactor-planner agent — it analyzes the codebase structure, drafts a plan with dry-run previews, and executes stages in order.
+For complex multi-step reorganizations, use the `/refactor` command to invoke the refactor-planner agent — it analyzes the codebase structure, drafts a preview plan, and executes stages in order.
 
 ---
 
@@ -148,11 +148,11 @@ Tests use hermetic fixtures — each test gets an isolated temporary project, so
 ```bash
 ./scripts/test.sh            # all tests
 ./scripts/test.sh -k python  # Python backend only
-./scripts/test.sh -k dry_run # dry-run mode only
+./scripts/test.sh -k "preview or dry_run" # preview mode only
 ./scripts/test.sh -v         # verbose
 ```
 
-Test coverage: `move_module`, `move_symbol`, `rename_symbol`, `validate_imports` — plus dry-run, error cases, and path escaping protection.
+Test coverage: `move_module`, `move_symbol`, `rename_symbol`, `validate_imports` — plus preview/apply mode, error cases, and path escaping protection.
 
 ## Notes
 
@@ -161,6 +161,6 @@ Test coverage: `move_module`, `move_symbol`, `rename_symbol`, `validate_imports`
 - Python `move_module` and `move_symbol` fail closed on two known Rope hazards rather than silently corrupt consumer files:
   - **Basename collision** — if the source file exports a top-level binding with the same name as the module (e.g. `project_service = ProjectService()` inside `project_service.py`), Rope confuses variable attribute access with module attribute access and rewrites `project_service.method()` call sites incorrectly. Rename the binding first, then retry.
   - **Lazy (in-function) imports** — Rope hoists in-function `import` statements to module top, breaking circular-import workarounds. If any consumer imports the moved module/symbol from inside a function, refactory refuses and lists every offending site. Un-lazy those imports (or resolve the underlying circular dependency) first.
-- Python apply-mode refactors accept `expected_git_root` as an optional worktree guard. Use it when running inside linked worktrees: keep `project_root` at the import root (for example `.../worker/backend`) and set `expected_git_root` to the intended git worktree root (for example `.../worker`). Refactory refuses to apply if those resolve to different worktrees.
-- Python `move_symbol` dry-run requires the target module to already exist on disk. Rope cannot compute an exact import-rewrite preview against a module it cannot read, and refactory refuses to fabricate or stage one. Create the destination file first (an empty file is fine) or run without `dry_run`.
+- Python refactors accept `expected_git_root` as an optional worktree guard. Use it when running inside linked worktrees: keep `project_root` at the import root (for example `.../worker/backend`) and set `expected_git_root` to the intended git worktree root (for example `.../worker`). Refactory refuses if those resolve to different worktrees.
+- Python `move_symbol` previews require the target module to already exist on disk. Rope cannot compute an exact import-rewrite preview against a module it cannot read, and refactory refuses to fabricate or stage one. Create the destination file first (an empty file is fine) or run with `apply: true`.
 - `move_symbol` is conservative across barrel / re-export boundaries. If the source is a pure re-export (`export { X } from "./impl"`) or if callers reach the symbol through a re-export chain, refactory refuses rather than guess — an honest refusal beats a silent corruption. A hand-rolled bash/ast-grep chain remains the right tool for those refactors.
