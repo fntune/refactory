@@ -102,35 +102,18 @@ class PythonBackend:
     def _prepare_project_root(
         self,
         project_root: str,
-        expected_git_root: str | None,
-    ) -> tuple[Path, Path | None]:
-        """Resolve project_root and verify it belongs to the expected worktree."""
-        root = Path(project_root).expanduser().resolve()
+    ) -> Path:
+        """Resolve an explicit absolute project_root."""
+        raw_root = Path(project_root).expanduser()
+        if not raw_root.is_absolute():
+            raise ValueError(f"project_root must be an absolute path: {project_root}")
+        root = raw_root.resolve()
         if not root.exists():
             raise ValueError(f"Project root does not exist: {project_root}")
+        if not root.is_dir():
+            raise ValueError(f"project_root is not a directory: {project_root}")
 
-        git_root = self._git_worktree_root(root)
-        if expected_git_root is None:
-            return root, git_root
-
-        expected = Path(expected_git_root).expanduser().resolve()
-        if not expected.exists():
-            raise ValueError(f"expected_git_root does not exist: {expected_git_root}")
-        if git_root is None:
-            raise ValueError(
-                f"project_root '{root}' is not inside a git worktree, "
-                f"but expected_git_root was set to '{expected}'"
-            )
-        if git_root != expected:
-            raise ValueError(
-                f"project_root '{root}' belongs to git worktree '{git_root}', "
-                f"not expected_git_root '{expected}'"
-            )
-        if not root.is_relative_to(expected):
-            raise ValueError(
-                f"project_root '{root}' is not inside expected_git_root '{expected}'"
-            )
-        return root, git_root
+        return root
 
     def _relative_path(self, path: Path, root: Path) -> str:
         return path.resolve().relative_to(root).as_posix()
@@ -706,6 +689,36 @@ class PythonBackend:
         )
         return f"from {dots}{module} import {names}"
 
+    def _scope_uses_qualified_symbol(
+        self,
+        scope: ast.AST | None,
+        module_reference: str,
+        symbol_name: str,
+    ) -> bool:
+        """Return true when a scope uses module_reference.symbol_name."""
+        if scope is None:
+            return False
+
+        for node in ast.walk(scope):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if node.attr != symbol_name:
+                continue
+            if self._dotted_name(node.value) == module_reference:
+                return True
+        return False
+
+    def _dotted_name(self, node: ast.AST) -> str | None:
+        """Return the dotted name for a Name/Attribute expression."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            prefix = self._dotted_name(node.value)
+            if prefix is None:
+                return None
+            return f"{prefix}.{node.attr}"
+        return None
+
     def _find_lazy_imports_of(
         self,
         py_file: Path,
@@ -729,20 +742,30 @@ class PythonBackend:
 
         hits: list[dict[str, Any]] = []
 
-        def visit(node: ast.AST, inside_function: bool) -> None:
+        def visit(node: ast.AST, inside_function: bool, function_scope: ast.AST | None) -> None:
             is_function = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            next_scope = node if is_function else function_scope
 
             if inside_function:
                 if isinstance(node, ast.Import):
-                    if symbol_name is None:
-                        for alias in node.names:
-                            resolved = self._find_local_module(root, alias.name.split("."))
-                            if resolved and self._same_file(resolved, target_source_path):
-                                as_clause = f" as {alias.asname}" if alias.asname else ""
-                                hits.append({
-                                    "line": node.lineno,
-                                    "text": f"import {alias.name}{as_clause}",
-                                })
+                    for alias in node.names:
+                        resolved = self._find_local_module(root, alias.name.split("."))
+                        if not resolved or not self._same_file(resolved, target_source_path):
+                            continue
+
+                        module_reference = alias.asname or alias.name
+                        if symbol_name is not None and not self._scope_uses_qualified_symbol(
+                            function_scope,
+                            module_reference,
+                            symbol_name,
+                        ):
+                            continue
+
+                        as_clause = f" as {alias.asname}" if alias.asname else ""
+                        hits.append({
+                            "line": node.lineno,
+                            "text": f"import {alias.name}{as_clause}",
+                        })
                 elif isinstance(node, ast.ImportFrom):
                     module_parts = self._resolve_import_parts(py_file, root, node.module, node.level)
                     if module_parts is not None:
@@ -780,9 +803,9 @@ class PythonBackend:
                                     break
 
             for child in ast.iter_child_nodes(node):
-                visit(child, inside_function or is_function)
+                visit(child, inside_function or is_function, next_scope)
 
-        visit(tree, False)
+        visit(tree, False, None)
         return hits
 
     def _find_basename_collision(self, source_path: Path) -> dict[str, Any] | None:
@@ -1144,10 +1167,9 @@ class PythonBackend:
         project_root: str,
         dry_run: bool,
         overwrite: bool = False,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Move a Python module and update all imports."""
-        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        root = self._prepare_project_root(project_root)
         source_path = self._validate_source_path(source, str(root))
         self._check_rope_hazards(source_path, root, "move_module")
         project = self._get_project(str(root))
@@ -1201,11 +1223,10 @@ class PythonBackend:
         target_file: str,
         project_root: str,
         dry_run: bool,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Move a symbol (function/class/variable) to another module."""
         validate_identifier(symbol_name, "python")
-        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        root = self._prepare_project_root(project_root)
         source_path = self._validate_source_path(source_file, str(root))
         target_path = self._validate_path(target_file, str(root))
         target_exists = target_path.exists()
@@ -1279,12 +1300,11 @@ class PythonBackend:
         dry_run: bool,
         line: int | None = None,
         column: int | None = None,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Rename a symbol across the codebase."""
         validate_identifier(new_name, "python")
         line, column = validate_position_selector(line, column)
-        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        root = self._prepare_project_root(project_root)
         file_path = self._validate_source_path(file, str(root))
 
         project = self._get_project(str(root))
@@ -1326,10 +1346,9 @@ class PythonBackend:
         file: str,
         project_root: str,
         dry_run: bool,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Organize imports in a Python module using Rope."""
-        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        root = self._prepare_project_root(project_root)
         file_path = self._validate_source_path(file, str(root))
         project = self._get_project(str(root))
         try:
@@ -1361,11 +1380,10 @@ class PythonBackend:
         end_column: int,
         project_root: str,
         dry_run: bool,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Extract a selected expression into a variable using Rope."""
         validate_identifier(new_name, "python")
-        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        root = self._prepare_project_root(project_root)
         file_path = self._validate_source_path(file, str(root))
         project = self._get_project(str(root))
         try:
@@ -1406,11 +1424,10 @@ class PythonBackend:
         end_column: int,
         project_root: str,
         dry_run: bool,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Extract selected statements into a function using Rope."""
         validate_identifier(new_name, "python")
-        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        root = self._prepare_project_root(project_root)
         file_path = self._validate_source_path(file, str(root))
         project = self._get_project(str(root))
         try:
@@ -1448,7 +1465,6 @@ class PythonBackend:
         column: int,
         project_root: str,
         dry_run: bool,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Inline a selected local variable, parameter, or function using Rope.
 
@@ -1461,7 +1477,7 @@ class PythonBackend:
         line, column = validate_position_selector(line, column)
         if line is None or column is None:
             raise ValueError("inline_symbol requires line and column")
-        root, _ = self._prepare_project_root(project_root, expected_git_root)
+        root = self._prepare_project_root(project_root)
         file_path = self._validate_source_path(file, str(root))
         project = self._get_project(str(root))
         resource = None
@@ -1575,12 +1591,12 @@ class PythonBackend:
     def validate_imports(self, project_root: str) -> list[dict[str, Any]]:
         """Check for broken imports in Python files."""
         errors = []
-        root = Path(project_root).resolve()
+        try:
+            root = self._prepare_project_root(project_root)
+        except ValueError as exc:
+            return [{"error": str(exc), "type": "invalid_root"}]
         exports_cache: dict[Path, set[str] | None] = {}
         external_exports_cache: dict[str, set[str] | None] = {}
-
-        if not root.exists():
-            return [{"error": f"Project root does not exist: {project_root}", "type": "invalid_root"}]
 
         for py_file in self._project_python_files_for_scan(root):
             try:

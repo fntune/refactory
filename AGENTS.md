@@ -79,8 +79,8 @@ The test suite uses hermetic fixtures (`tests/conftest.py`) that create isolated
 ### Tool Interface (What Codex Calls)
 
 All tools accept:
-- `project_root` (optional, defaults to `"."`)
-- `dry_run` (optional, defaults to `false`)
+- `project_root` (required absolute path)
+- `apply` (optional, defaults to preview mode unless exactly `true`)
 - Language-specific parameters
 
 Tools return structured JSON with operation summary and affected files list.

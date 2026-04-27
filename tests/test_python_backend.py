@@ -74,6 +74,39 @@ class TestMoveModule:
         assert "from src.storage.db import Database" in main_content
         assert "from src.db import Database" not in main_content
 
+    def test_move_module_renames_basename(self, python_backend, tmp_path):
+        """Moving to a different filename should apply move + rename once."""
+        project = tmp_path / "project"
+        project.mkdir()
+        package = project / "pkg"
+        consumer = project / "consumer"
+        package.mkdir()
+        consumer.mkdir()
+        (package / "__init__.py").write_text("")
+        (consumer / "__init__.py").write_text("")
+        (package / "source.py").write_text(
+            "def answer():\n"
+            "    return 42\n"
+        )
+        (consumer / "use_source.py").write_text(
+            "from pkg.source import answer\n\n"
+            "VALUE = answer()\n"
+        )
+
+        result = python_backend.move_module(
+            source="pkg/source.py",
+            target="pkg/moved.py",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        assert not (package / "source.py").exists()
+        assert (package / "moved.py").exists()
+        assert "from pkg.moved import answer" in (
+            consumer / "use_source.py"
+        ).read_text()
+
     def test_move_module_dry_run_no_changes(self, python_backend, temp_python_project):
         """Dry run should preview without making changes."""
         original_content = (temp_python_project / "src" / "db.py").read_text()
@@ -966,6 +999,81 @@ class TestRopeHazardDetectors:
         assert "def do_work" in (project / "worker.py").read_text()
         assert (project / "target.py").read_text() == ""
 
+    def test_move_symbol_fails_on_module_style_lazy_import(
+        self, python_backend, tmp_path
+    ):
+        """Module-style lazy imports of the moved symbol should also fail closed."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "worker.py").write_text(
+            "def do_work():\n"
+            "    return 1\n\n"
+            "def other():\n"
+            "    return 2\n"
+        )
+        (project / "target.py").write_text("")
+        (project / "consumer.py").write_text(
+            "def run():\n"
+            "    import worker\n"
+            "    return worker.do_work()\n"
+        )
+
+        original_worker = (project / "worker.py").read_text()
+        original_target = (project / "target.py").read_text()
+        original_consumer = (project / "consumer.py").read_text()
+
+        with pytest.raises(ValueError, match="lazy"):
+            python_backend.move_symbol(
+                source_file="worker.py",
+                symbol_name="do_work",
+                target_file="target.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        assert (project / "worker.py").read_text() == original_worker
+        assert (project / "target.py").read_text() == original_target
+        assert (project / "consumer.py").read_text() == original_consumer
+
+    def test_move_symbol_fails_on_dotted_module_style_lazy_import(
+        self, python_backend, tmp_path
+    ):
+        """Package-qualified lazy imports of the moved symbol should fail closed."""
+        project = tmp_path / "project"
+        project.mkdir()
+        package = project / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "worker.py").write_text(
+            "def do_work():\n"
+            "    return 1\n\n"
+            "def other():\n"
+            "    return 2\n"
+        )
+        (project / "target.py").write_text("")
+        (project / "consumer.py").write_text(
+            "def run():\n"
+            "    import pkg.worker\n"
+            "    return pkg.worker.do_work()\n"
+        )
+
+        original_worker = (package / "worker.py").read_text()
+        original_target = (project / "target.py").read_text()
+        original_consumer = (project / "consumer.py").read_text()
+
+        with pytest.raises(ValueError, match="lazy"):
+            python_backend.move_symbol(
+                source_file="pkg/worker.py",
+                symbol_name="do_work",
+                target_file="target.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        assert (package / "worker.py").read_text() == original_worker
+        assert (project / "target.py").read_text() == original_target
+        assert (project / "consumer.py").read_text() == original_consumer
+
     def test_move_symbol_ignores_lazy_imports_of_other_symbols(
         self, python_backend, tmp_path
     ):
@@ -1044,35 +1152,23 @@ class TestRopeHazardDetectors:
         assert (project / "bg" / "worker.py").exists()
 
 
-class TestWorktreeIsolation:
-    """Guards against applying Rope changes to the wrong git worktree."""
+class TestProjectRootGuards:
+    """Guards against cwd drift and cross-root writes."""
 
-    def test_expected_git_root_blocks_wrong_worktree(
-        self, python_backend, tmp_path
-    ):
-        """A worker-root guard should catch accidental main-checkout roots."""
-        if not shutil.which("git"):
-            pytest.skip("git not available")
-
-        main_repo, worker = _make_git_repo_with_backend(tmp_path)
-
-        with pytest.raises(ValueError, match="not expected_git_root"):
+    def test_relative_project_root_rejected(self, python_backend):
+        """Backend callers must pass an absolute project_root."""
+        with pytest.raises(ValueError, match="absolute path"):
             python_backend.move_module(
                 source="pkg/db.py",
                 target="pkg/storage/db.py",
-                project_root=str(main_repo / "backend"),
+                project_root="backend",
                 dry_run=False,
-                expected_git_root=str(worker),
             )
-
-        assert (main_repo / "backend" / "pkg" / "db.py").exists()
-        assert not (main_repo / "backend" / "pkg" / "storage").exists()
-        assert _git(main_repo, "status", "--short").stdout == ""
 
     def test_linked_worktree_move_mutates_only_worker(
         self, python_backend, tmp_path
     ):
-        """A move in a linked worktree must leave the main checkout untouched."""
+        """A move mutates only the explicit project_root checkout."""
         if not shutil.which("git"):
             pytest.skip("git not available")
 
@@ -1083,7 +1179,6 @@ class TestWorktreeIsolation:
             target="pkg/storage/db.py",
             project_root=str(worker / "backend"),
             dry_run=False,
-            expected_git_root=str(worker),
         )
 
         assert result["success"]

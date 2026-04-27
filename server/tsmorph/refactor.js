@@ -46,6 +46,15 @@ function validatePath(filePath, projectRoot) {
   return resolvedPath;
 }
 
+function validateSourceExtension(filePath, label) {
+  const extension = path.extname(filePath);
+  if (!SUPPORTED_EXTENSIONS.has(extension)) {
+    throw new Error(
+      `${label} must be a TypeScript/JavaScript source file (${[...SUPPORTED_EXTENSIONS].join(", ")}): ${filePath}`
+    );
+  }
+}
+
 function getProject(projectRoot) {
   const root = path.resolve(projectRoot);
   if (!fs.existsSync(root)) {
@@ -574,10 +583,12 @@ function classifyImportDeclaration(declaration) {
   }
 
   const moduleSpecifier = importDeclaration.getModuleSpecifierValue();
+  const resolvedFilePath = importDeclaration.getModuleSpecifierSourceFile()?.getFilePath();
   if (Node.isImportSpecifier(declaration)) {
     return {
       kind: "named",
       moduleSpecifier,
+      resolvedFilePath,
       name: declaration.getName(),
       alias: declaration.getAliasNode()?.getText(),
       isTypeOnly: declaration.isTypeOnly() || importDeclaration.isTypeOnly(),
@@ -587,6 +598,7 @@ function classifyImportDeclaration(declaration) {
     return {
       kind: "default",
       moduleSpecifier,
+      resolvedFilePath,
       name: declaration.getDefaultImport().getText(),
       isTypeOnly: importDeclaration.isTypeOnly(),
     };
@@ -595,6 +607,7 @@ function classifyImportDeclaration(declaration) {
     return {
       kind: "namespace",
       moduleSpecifier,
+      resolvedFilePath,
       name: declaration.getText(),
       isTypeOnly: false,
     };
@@ -762,6 +775,16 @@ function ensureDependencyImport(targetFile, moduleSpecifier, dependency) {
   }
 }
 
+function dependencyModuleSpecifier(targetFilePath, dependency, project) {
+  if (dependency.moduleSpecifier.startsWith(".") && dependency.resolvedFilePath) {
+    return toModuleSpecifier(targetFilePath, dependency.resolvedFilePath, {
+      originalSpecifier: dependency.moduleSpecifier,
+      project,
+    });
+  }
+  return dependency.moduleSpecifier;
+}
+
 function collectModuleReferences(files, sourceFilePath) {
   return files
     .filter((file) => file.getFilePath() !== sourceFilePath)
@@ -804,6 +827,8 @@ function moveModule(args) {
 
   const sourcePath = validatePath(source, projectRoot);
   const targetPath = validatePath(target, projectRoot);
+  validateSourceExtension(source, "source");
+  validateSourceExtension(target, "target");
   if (sourcePath === targetPath) {
     throw new Error("source and target are identical");
   }
@@ -893,6 +918,8 @@ function moveSymbol(args) {
   const { sourceFile: srcPath, symbolName, targetFile: tgtPath, projectRoot, dryRun } = args;
   const sourcePath = validatePath(srcPath, projectRoot);
   const targetPath = validatePath(tgtPath, projectRoot);
+  validateSourceExtension(srcPath, "source_file");
+  validateSourceExtension(tgtPath, "target_file");
   if (sourcePath === targetPath) {
     throw new Error("source and target are identical");
   }
@@ -950,7 +977,11 @@ function moveSymbol(args) {
     targetFile.addStatements(getMovedSymbolText(symbol));
 
     for (const dependency of dependencies.passThroughImports) {
-      ensureDependencyImport(targetFile, dependency.moduleSpecifier, dependency);
+      ensureDependencyImport(
+        targetFile,
+        dependencyModuleSpecifier(targetFilePath, dependency, project),
+        dependency
+      );
     }
 
     for (const dependency of dependencies.sourceLocalRefs) {
@@ -1079,6 +1110,7 @@ function moveSymbol(args) {
 function renameSymbol(args) {
   const { file, oldName, newName, projectRoot, dryRun, line = null, column = null } = args;
   const sourcePath = validatePath(file, projectRoot);
+  validateSourceExtension(file, "file");
   const project = getProject(projectRoot);
   const root = path.resolve(projectRoot);
   const loaded = loadProjectSourceFiles(project, root);

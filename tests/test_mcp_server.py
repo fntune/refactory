@@ -40,6 +40,9 @@ class TestToolListing:
             assert tool.inputSchema is not None
             assert tool.inputSchema.get("type") == "object"
             assert "properties" in tool.inputSchema
+            if "project_root" in tool.inputSchema["properties"]:
+                assert "project_root" in tool.inputSchema.get("required", [])
+            assert "expected_git_root" not in tool.inputSchema["properties"]
 
     @pytest.mark.asyncio
     async def test_move_module_schema(self):
@@ -53,7 +56,7 @@ class TestToolListing:
         assert "source" in props
         assert "target" in props
         assert "project_root" in props
-        assert "expected_git_root" in props
+        assert "expected_git_root" not in props
         assert "apply" in props
         assert "dry_run" not in props
         assert "overwrite" in props
@@ -61,6 +64,7 @@ class TestToolListing:
         required = move_module.inputSchema["required"]
         assert "source" in required
         assert "target" in required
+        assert "project_root" in required
 
     @pytest.mark.asyncio
     async def test_rename_symbol_schema(self):
@@ -238,6 +242,34 @@ class TestErrorHandling:
 
         data = json.loads(result[0].text)
         assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_missing_project_root_handled(self):
+        """All tool calls must provide an explicit project_root."""
+        from main import call_tool
+
+        result = await call_tool("move_module", {
+            "source": "src/db.py",
+            "target": "src/storage/db.py",
+        })
+
+        data = json.loads(result[0].text)
+        assert "error" in data
+        assert "project_root is required" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_relative_project_root_rejected(self):
+        """project_root must be absolute so cwd drift cannot pick a checkout."""
+        from main import call_tool
+
+        result = await call_tool("validate_imports", {
+            "project_root": ".",
+            "language": "python",
+        })
+
+        data = json.loads(result[0].text)
+        assert "error" in data
+        assert "project_root must be an absolute path" in data["error"]
 
     @pytest.mark.asyncio
     async def test_nonexistent_file_handled(self, temp_python_project):

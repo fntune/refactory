@@ -63,51 +63,16 @@ class TypeScriptBackend:
 
         return json.loads(result.stdout)
 
-    def _git_worktree_root(self, path: Path) -> Path | None:
-        """Return the git worktree root containing path, or None outside git."""
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if result.returncode != 0:
-            return None
-        return Path(result.stdout.strip()).resolve()
-
-    def _prepare_project_root(
-        self,
-        project_root: str,
-        expected_git_root: str | None,
-    ) -> str:
-        """Resolve project_root and verify it belongs to the expected worktree."""
-        root = Path(project_root).expanduser().resolve()
-        if expected_git_root is None:
-            return str(root)
-
-        expected = Path(expected_git_root).expanduser().resolve()
-        if not expected.exists():
-            raise ValueError(f"expected_git_root does not exist: {expected_git_root}")
-
-        git_root = self._git_worktree_root(root)
-        if git_root is None:
-            raise ValueError(
-                f"project_root '{root}' is not inside a git worktree, "
-                f"but expected_git_root was set to '{expected}'"
-            )
-        if git_root != expected:
-            raise ValueError(
-                f"project_root '{root}' belongs to git worktree '{git_root}', "
-                f"not expected_git_root '{expected}'"
-            )
-        if not root.is_relative_to(expected):
-            raise ValueError(
-                f"project_root '{root}' is not inside expected_git_root '{expected}'"
-            )
+    def _prepare_project_root(self, project_root: str) -> str:
+        """Resolve an explicit absolute project_root."""
+        raw_root = Path(project_root).expanduser()
+        if not raw_root.is_absolute():
+            raise ValueError(f"project_root must be an absolute path: {project_root}")
+        root = raw_root.resolve()
+        if not root.exists():
+            raise ValueError(f"Project root does not exist: {project_root}")
+        if not root.is_dir():
+            raise ValueError(f"project_root is not a directory: {project_root}")
         return str(root)
 
     def move_module(
@@ -117,10 +82,9 @@ class TypeScriptBackend:
         project_root: str,
         dry_run: bool,
         overwrite: bool = False,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Move a TypeScript module and update all imports."""
-        project_root = self._prepare_project_root(project_root, expected_git_root)
+        project_root = self._prepare_project_root(project_root)
         return self._run_tsmorph("move_module", {
             "source": source,
             "target": target,
@@ -136,11 +100,10 @@ class TypeScriptBackend:
         target_file: str,
         project_root: str,
         dry_run: bool,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Move a symbol (function/class) to another module."""
         validate_identifier(symbol_name, "typescript")
-        project_root = self._prepare_project_root(project_root, expected_git_root)
+        project_root = self._prepare_project_root(project_root)
         return self._run_tsmorph("move_symbol", {
             "sourceFile": source_file,
             "symbolName": symbol_name,
@@ -158,12 +121,11 @@ class TypeScriptBackend:
         dry_run: bool,
         line: int | None = None,
         column: int | None = None,
-        expected_git_root: str | None = None,
     ) -> dict[str, Any]:
         """Rename a symbol across the codebase."""
         validate_identifier(new_name, "typescript")
         line, column = validate_position_selector(line, column)
-        project_root = self._prepare_project_root(project_root, expected_git_root)
+        project_root = self._prepare_project_root(project_root)
         return self._run_tsmorph("rename_symbol", {
             "file": file,
             "oldName": old_name,
@@ -176,6 +138,7 @@ class TypeScriptBackend:
 
     def validate_imports(self, project_root: str) -> list[dict[str, Any]]:
         """Check for broken imports in TypeScript files."""
+        project_root = self._prepare_project_root(project_root)
         result = self._run_tsmorph("validate_imports", {
             "projectRoot": project_root,
         })

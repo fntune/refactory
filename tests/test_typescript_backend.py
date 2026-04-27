@@ -146,6 +146,21 @@ class TestMoveModule:
                 dry_run=False,
             )
 
+    def test_move_module_rejects_unsupported_target_extension(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """Moving a module should not write TypeScript into non-source files."""
+        with pytest.raises(Exception, match="target must be a TypeScript/JavaScript source file"):
+            typescript_backend.move_module(
+                source="src/db.ts",
+                target="src/db.txt",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+
+        assert (temp_typescript_project / "src" / "db.ts").exists()
+        assert not (temp_typescript_project / "src" / "db.txt").exists()
+
     def test_move_module_overwrites_existing_target(
         self, typescript_backend, temp_typescript_project
     ):
@@ -500,6 +515,59 @@ class TestMoveSymbol:
         assert result["success"]
         assert "const type = 1" in (project / "src" / "target.ts").read_text()
 
+    def test_move_symbol_rebases_pass_through_imports(
+        self, typescript_backend, tmp_path
+    ):
+        """Imports used by the moved symbol should resolve from the target file."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true,"rootDir":"src","outDir":"dist"},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "nested").mkdir()
+        (project / "src" / "dep.ts").write_text("export const dep = 41;\n")
+        (project / "src" / "source.ts").write_text(
+            'import { dep as renamedDep } from "./dep";\n'
+            "export function helper(): number {\n"
+            "    return renamedDep + 1;\n"
+            "}\n"
+        )
+        (project / "src" / "consumer.ts").write_text(
+            'import { helper } from "./source";\n'
+            "export const output = helper();\n"
+        )
+        (project / "src" / "nested" / "target.ts").write_text("")
+
+        result = typescript_backend.move_symbol(
+            source_file="src/source.ts",
+            symbol_name="helper",
+            target_file="src/nested/target.ts",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        target = (project / "src" / "nested" / "target.ts").read_text()
+        assert 'import { dep as renamedDep } from "../dep"' in target
+        assert "renamedDep + 1" in target
+        assert typescript_backend.validate_imports(str(project)) == []
+
+    def test_move_symbol_rejects_unsupported_target_extension(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """Moving a symbol should not create non-source target files."""
+        with pytest.raises(Exception, match="target_file must be a TypeScript/JavaScript source file"):
+            typescript_backend.move_symbol(
+                source_file="src/utils.ts",
+                symbol_name="helperFunc",
+                target_file="src/helpers.txt",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+            )
+
+        assert not (temp_typescript_project / "src" / "helpers.txt").exists()
+
 
 class TestRenameSymbol:
     """Tests for rename_symbol operation."""
@@ -556,6 +624,24 @@ class TestRenameSymbol:
         assert result["dry_run"]
         assert "preview" in result
         assert (temp_typescript_project / "src" / "utils.ts").read_text() == original
+
+    def test_rename_rejects_unsupported_source_extension(
+        self, typescript_backend, tmp_path
+    ):
+        """Renaming should only operate on supported source files."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "src").mkdir()
+        (project / "src" / "values.txt").write_text("export const value = 1;\n")
+
+        with pytest.raises(Exception, match="file must be a TypeScript/JavaScript source file"):
+            typescript_backend.rename_symbol(
+                file="src/values.txt",
+                old_name="value",
+                new_name="renamed",
+                project_root=str(project),
+                dry_run=False,
+            )
 
     def test_rename_updates_callers_without_tsconfig(
         self, typescript_backend, temp_typescript_no_tsconfig_project

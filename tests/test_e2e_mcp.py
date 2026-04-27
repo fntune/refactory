@@ -111,6 +111,39 @@ class TestMcpE2E:
         assert "preview" in data
         assert snapshot_tree(temp_python_project) == before
 
+    async def test_python_move_module_apply_renames_basename_over_stdio(self, tmp_path):
+        """MCP apply should handle Python move_module with a filename change."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "pkg").mkdir()
+        (project / "consumer").mkdir()
+        (project / "pkg" / "__init__.py").write_text("")
+        (project / "consumer" / "__init__.py").write_text("")
+        (project / "pkg" / "source.py").write_text(
+            "def answer():\n"
+            "    return 42\n"
+        )
+        (project / "consumer" / "use_source.py").write_text(
+            "from pkg.source import answer\n\n"
+            "VALUE = answer()\n"
+        )
+
+        async with open_mcp_session() as session:
+            data = await call_json(session, "move_module", {
+                "source": "pkg/source.py",
+                "target": "pkg/moved.py",
+                "project_root": str(project),
+                "apply": True,
+            })
+
+        assert data["success"]
+        assert data["apply"] is True
+        assert not (project / "pkg" / "source.py").exists()
+        assert (project / "pkg" / "moved.py").exists()
+        assert "from pkg.moved import answer" in (
+            project / "consumer" / "use_source.py"
+        ).read_text()
+
     async def test_python_parameter_rename_with_selector_over_stdio(self, tmp_path):
         """Selector-based parameter renames should work end to end through MCP."""
         project = tmp_path / "project"

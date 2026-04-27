@@ -66,6 +66,17 @@ def format_apply_result(result: dict[str, Any], apply_changes: bool) -> dict[str
     return formatted
 
 
+def require_project_root(arguments: dict[str, Any]) -> str:
+    """Return the required absolute project root for a tool call."""
+    project_root = arguments.get("project_root")
+    if not project_root:
+        raise ValueError("project_root is required and must be an absolute path")
+    root = Path(project_root).expanduser()
+    if not root.is_absolute():
+        raise ValueError(f"project_root must be an absolute path: {project_root}")
+    return str(root)
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available refactoring tools."""
@@ -86,11 +97,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
-                    },
-                    "expected_git_root": {
-                        "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
+                        "description": "Absolute root directory of the project",
                     },
                     "apply": {
                         "type": "boolean",
@@ -103,7 +110,7 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                     },
                 },
-                "required": ["source", "target"],
+                "required": ["source", "target", "project_root"],
             },
         ),
         Tool(
@@ -126,11 +133,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
-                    },
-                    "expected_git_root": {
-                        "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
+                        "description": "Absolute root directory of the project",
                     },
                     "apply": {
                         "type": "boolean",
@@ -138,7 +141,7 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                     },
                 },
-                "required": ["source_file", "symbol_name", "target_file"],
+                "required": ["source_file", "symbol_name", "target_file", "project_root"],
             },
         ),
         Tool(
@@ -161,11 +164,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
-                    },
-                    "expected_git_root": {
-                        "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
+                        "description": "Absolute root directory of the project",
                     },
                     "apply": {
                         "type": "boolean",
@@ -181,7 +180,7 @@ async def list_tools() -> list[Tool]:
                         "description": "1-based declaration column for disambiguating parameter renames",
                     },
                 },
-                "required": ["file", "old_name", "new_name"],
+                "required": ["file", "old_name", "new_name", "project_root"],
             },
         ),
         Tool(
@@ -192,7 +191,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
+                        "description": "Absolute root directory of the project",
                     },
                     "language": {
                         "type": "string",
@@ -200,6 +199,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Language to validate (validates all if not specified)",
                     },
                 },
+                "required": ["project_root"],
             },
         ),
         Tool(
@@ -214,11 +214,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
-                    },
-                    "expected_git_root": {
-                        "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
+                        "description": "Absolute root directory of the project",
                     },
                     "apply": {
                         "type": "boolean",
@@ -226,7 +222,7 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                     },
                 },
-                "required": ["file"],
+                "required": ["file", "project_root"],
             },
         ),
         Tool(
@@ -246,11 +242,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
-                    },
-                    "expected_git_root": {
-                        "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
+                        "description": "Absolute root directory of the project",
                     },
                     "apply": {
                         "type": "boolean",
@@ -265,6 +257,7 @@ async def list_tools() -> list[Tool]:
                     "start_column",
                     "end_line",
                     "end_column",
+                    "project_root",
                 ],
             },
         ),
@@ -285,11 +278,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
-                    },
-                    "expected_git_root": {
-                        "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
+                        "description": "Absolute root directory of the project",
                     },
                     "apply": {
                         "type": "boolean",
@@ -304,6 +293,7 @@ async def list_tools() -> list[Tool]:
                     "start_column",
                     "end_line",
                     "end_column",
+                    "project_root",
                 ],
             },
         ),
@@ -318,11 +308,7 @@ async def list_tools() -> list[Tool]:
                     "column": {"type": "integer", "description": "1-based column containing the symbol"},
                     "project_root": {
                         "type": "string",
-                        "description": "Root directory of the project (defaults to cwd)",
-                    },
-                    "expected_git_root": {
-                        "type": "string",
-                        "description": "Optional absolute git worktree root that project_root must belong to before previewing or applying changes",
+                        "description": "Absolute root directory of the project",
                     },
                     "apply": {
                         "type": "boolean",
@@ -330,7 +316,7 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                     },
                 },
-                "required": ["file", "line", "column"],
+                "required": ["file", "line", "column", "project_root"],
             },
         ),
     ]
@@ -340,10 +326,9 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Execute a refactoring tool."""
     try:
-        project_root = arguments.get("project_root", ".")
+        project_root = require_project_root(arguments)
         apply_changes = arguments.get("apply") is True
         dry_run = not apply_changes
-        expected_git_root = arguments.get("expected_git_root")
 
         if name == "move_module":
             source = arguments["source"]
@@ -357,7 +342,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 project_root,
                 dry_run,
                 overwrite=overwrite,
-                expected_git_root=expected_git_root,
             )
 
         elif name == "move_symbol":
@@ -372,7 +356,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 target_file,
                 project_root,
                 dry_run,
-                expected_git_root=expected_git_root,
             )
 
         elif name == "rename_symbol":
@@ -393,7 +376,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 dry_run,
                 line=line,
                 column=column,
-                expected_git_root=expected_git_root,
             )
 
         elif name == "validate_imports":
@@ -413,7 +395,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 arguments["file"],
                 project_root,
                 dry_run,
-                expected_git_root=expected_git_root,
             )
 
         elif name == "extract_variable":
@@ -427,7 +408,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 end_column=arguments["end_column"],
                 project_root=project_root,
                 dry_run=dry_run,
-                expected_git_root=expected_git_root,
             )
 
         elif name == "extract_function":
@@ -441,7 +421,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 end_column=arguments["end_column"],
                 project_root=project_root,
                 dry_run=dry_run,
-                expected_git_root=expected_git_root,
             )
 
         elif name == "inline_symbol":
@@ -452,7 +431,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 column=arguments["column"],
                 project_root=project_root,
                 dry_run=dry_run,
-                expected_git_root=expected_git_root,
             )
 
         else:
